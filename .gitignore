@@ -1,0 +1,30 @@
+# Keep real data and anything derived from it out of git.
+# Data lives outside this repo (~/work/SoC); these are a safety net.
+*.csv
+*.tsv
+*.tab
+*.psv
+*.xlsx
+*.xlsm
+*.xls
+*.ndjson
+*.jsonl
+*.json
+*.log
+*.gz
+!.claude/settings.json
+!tests/**/*.py
+
+# outputs, mappings, reviewer reports
+anonymized/
+samples/
+out/
+mapping*.json
+review_report*.jsonl
+terms*.txt
+
+# python / tooling
+__pycache__/
+.pytest_cache/
+.venv/
+.claude/settings.local.json

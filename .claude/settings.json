@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Read(~/work/SoC/**)",
+      "Read(~/work/SoC-samples/**)",
+      "Edit(~/work/SoC/**)",
+      "Edit(~/work/SoC-samples/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": ["~/work/SoC", "~/work/SoC-samples"],
+      "allowWrite": ["~/.cache/uv", "~/.local/share/uv"]
+    },
+    "network": {
+      "allowedDomains": ["pypi.org", "files.pythonhosted.org", "github.com", "objects.githubusercontent.com"]
+    }
+  }
+}
