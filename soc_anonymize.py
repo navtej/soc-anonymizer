@@ -936,6 +936,14 @@ def xlsx_sheet_mb(path):
     except zipfile.BadZipFile:
         return 0.0
 
+XL_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+def xl_safe(v):
+    """openpyxl refuses control characters in cells (Excel stores them as _xHHHH_
+    escapes, which calamine / openpyxl decode on read); replace them with U+FFFD
+    before scrubbing, so names split by them are still matched."""
+    return XL_ILLEGAL.sub("\ufffd", v) if isinstance(v, str) else v
+
 def process_xlsx(path, out, anon, ui, full_max_mb):
     """Small books: full-fidelity in-place scrub. Large books (or sheets formatted
     down to row 1,048,576): fast calamine read + streaming write, values only."""
@@ -969,7 +977,7 @@ def process_xlsx_fast(path, out, anon, ui, size_mb):
         header = None
         for row in rows:
             ui.advance()
-            vals = [None if v == "" else v for v in row]
+            vals = [None if v == "" else xl_safe(v) for v in row]
             if header is None:
                 if _nonempty(vals):
                     header = [str(v) if v is not None else None for v in vals]
@@ -1014,11 +1022,12 @@ def process_xlsx_full(path, out, anon, ui):
                     header = [str(c.value) if c.value is not None else None for c in row]
                     for c in row:                  # rules only: keeps real headers intact
                         if isinstance(c.value, str):
-                            c.value = apply_rules(c.value, anon.rules)
+                            c.value = apply_rules(xl_safe(c.value), anon.rules)
                 continue
             for i, c in enumerate(row):
                 v = c.value
                 if isinstance(v, str) and v:
+                    v = xl_safe(v)
                     if c.data_type == "f":         # formula: scrub string literals, no NER
                         c.value = apply_rules(v, anon.rules)
                         stats["formulas"] += 1

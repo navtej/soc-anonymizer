@@ -39,7 +39,7 @@ Examples:
 Writes sample_manifest.json (seed, percent, per-file counts) next to the samples.
 Samples contain REAL data - treat them exactly like the originals.
 """
-import argparse, csv, gzip, io, json, math, os, random, secrets, signal, sys, threading, time
+import argparse, csv, gzip, io, json, math, os, random, re, secrets, signal, sys, threading, time
 from copy import copy
 from pathlib import Path
 
@@ -300,6 +300,13 @@ def xlsx_sheet_mb(path):
     except zipfile.BadZipFile:
         return 0.0
 
+XL_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+def xl_safe(v):
+    """openpyxl refuses control characters in cells (Excel stores them as _xHHHH_
+    escapes, which calamine / openpyxl decode on read); replace them with U+FFFD."""
+    return XL_ILLEGAL.sub("\ufffd", v) if isinstance(v, str) else v
+
 def sample_xlsx(src, dst, sampler, key, ui, full_max_mb):
     """Full-fidelity copy only for books whose sheet data is small enough to load
     quickly; everything else goes through the fast calamine path."""
@@ -343,10 +350,10 @@ def sample_xlsx_fast(src, dst, sampler, key, ui, size_mb):
         if header is not None:
             cells = []
             for v in header:
-                c = WriteOnlyCell(ws, value=None if v == "" else v); c.font = bold; cells.append(c)
+                c = WriteOnlyCell(ws, value=None if v == "" else xl_safe(v)); c.font = bold; cells.append(c)
             ws.append(cells)
         for i in idx:
-            ws.append([None if v == "" else v for v in data[i]])
+            ws.append([None if v == "" else xl_safe(v) for v in data[i]])
         ui.advance(len(data))
         kept += len(idx)
     out.save(_xlsx_dst(src, dst))
@@ -392,7 +399,7 @@ def sample_xlsx_full(src, dst, sampler, key, ui):
             for c in row:
                 if not hasattr(c, "column") or (c.value is None and not c.has_style):
                     continue
-                nc = nws.cell(row=r_out, column=c.column, value=c.value)
+                nc = nws.cell(row=r_out, column=c.column, value=xl_safe(c.value))
                 if c.has_style:
                     nc.font, nc.fill, nc.border = copy(c.font), copy(c.fill), copy(c.border)
                     nc.alignment, nc.protection = copy(c.alignment), copy(c.protection)

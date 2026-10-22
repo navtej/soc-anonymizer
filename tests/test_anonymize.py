@@ -291,3 +291,13 @@ def test_ctrl_c_is_immediate(tmp_path):
     assert p.returncode == 130, out
     assert time.monotonic() - t0 < 1.0, "Ctrl-C took too long"
     assert not (tmp_path / "out" / "rows.csv").exists(), "partial output left behind"
+
+
+def test_xlsx_control_characters(tmp_path):
+    """calamine (fast path) decodes _x0000_ to a raw control char openpyxl can't write."""
+    src = fixtures.build_control_chars_xlsx(tmp_path)
+    run([src.name, "-o", "out", "--no-ner", "--xlsx-full-max-mb", "0"], tmp_path)
+    from openpyxl import load_workbook
+    ws = load_workbook(tmp_path / "out" / "ctrl.xlsx").active
+    assert ws.max_row == 11
+    assert "\ufffd" in ws["B2"].value

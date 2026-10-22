@@ -186,3 +186,18 @@ def build_sampling_set(folder):
     (d / "sub" / "app.log").write_text("\n".join(f"log line {i}" for i in range(100)) + "\n")
     (d / "legacy.xls").write_bytes(b"")
     return d
+
+
+def build_control_chars_xlsx(folder):
+    """Cells holding control characters: Excel stores them as _xHHHH_ escapes,
+    which openpyxl / calamine decode to raw chars that openpyxl refuses to write."""
+    from openpyxl import Workbook
+    d = Path(folder)
+    d.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Account", "Notes"])
+    for i in range(10):
+        ws.append(["NT AU_x001E_THORITY\\SYSTEM", f"Priya_x0000_Sharma ran job {i}"])
+    wb.save(d / "ctrl.xlsx")
+    return d / "ctrl.xlsx"

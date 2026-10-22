@@ -72,3 +72,13 @@ def test_line_endings_preserved(tmp_path):
     run(["lf.csv", "crlf.csv", "-p", "100", "-o", "out"], tmp_path)
     assert (tmp_path / "out" / "lf.csv").read_bytes() == b"a,b\n1,x\n2,y\n"
     assert (tmp_path / "out" / "crlf.csv").read_bytes() == b"a,b\r\n1,x\r\n2,y\r\n"
+
+
+def test_xlsx_control_characters(tmp_path):
+    """calamine (fast path) decodes _x001E_ to a raw control char openpyxl can't write."""
+    fixtures.build_control_chars_xlsx(tmp_path / "in")
+    run(["in", "-o", "out", "-p", "100", "--xlsx-full-max-mb", "0"], tmp_path)
+    from openpyxl import load_workbook
+    ws = load_workbook(tmp_path / "out" / "ctrl.xlsx").active
+    assert ws.max_row == 11
+    assert ws["A2"].value == "NT AU\ufffdTHORITY\\SYSTEM"
