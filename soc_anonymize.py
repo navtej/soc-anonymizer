@@ -3,8 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "gliner2[local]>=2.1,<3",  # [local] = on-device inference (torch, transformers)
-#     "openpyxl>=3.1",           # .xlsx / .xlsm
-#     "python-calamine>=0.2",    # fast reading of large .xlsx (Rust)
+#     "openpyxl>=3.1",           # .xlsx / .xlsm (large books streamed in read-only mode)
 #     "rich>=13",                # progress display
 # ]
 # ///
@@ -16,9 +15,13 @@ Excel (.xlsx/.xlsm): all sheets incl. hidden ones; row 1 of each sheet is the
 header. Books whose uncompressed sheet data is <= --xlsx-full-max-mb keep formatting:
 comments, hyperlinks, string literals inside formulas and workbook metadata
 (author etc.) are scrubbed; pivot tables are dropped because their cache holds
-an unscrubbed copy of the data. Larger books use a fast streaming mode: values
+an unscrubbed copy of the data. Larger books are streamed row by row: values
 only (formulas become cached values; comments/links/formatting are not copied). Numbers stored as numeric cells
 (e.g. a phone number typed as 9814012345) are not touched.
+
+Files are streamed, never loaded whole: CSV/TSV rows, log lines, NDJSON records and
+the records of a JSON document (top-level array, or arrays under a top-level object
+like Azure {"value": [...]}) are read, scrubbed and written one at a time.
 
 Before anything is written, all inputs are pre-scanned: values of identity
 columns (Assignee, Reporter, Tenant/Customer, Issue key/id, Assignee Id, Owner,
@@ -859,19 +862,22 @@ class UI:
     printed above the bars as fixed-width summary lines."""
 
     def __init__(self, n_files, ner=None, reviewer=None, enabled=True):
-        from rich.progress import (BarColumn, MofNCompleteColumn, Progress, TaskProgressColumn,
+        from rich.progress import (BarColumn, Progress, TaskProgressColumn,
                                    TextColumn, TimeElapsedColumn, TimeRemainingColumn)
         from rich.table import Column
         self.ner, self.reviewer, self.enabled = ner, reviewer, enabled
         self.progress = Progress(
             TextColumn("{task.description}", markup=False, table_column=Column(width=NAME_W, no_wrap=True)),
             BarColumn(bar_width=28), TaskProgressColumn(),
-            MofNCompleteColumn(table_column=Column(justify="right", min_width=11)),
+            TextColumn("{task.fields[count]}", markup=False, justify="right",
+                       table_column=Column(justify="right", min_width=11)),
             TextColumn("{task.fields[unit]}", markup=False, table_column=Column(width=7)),
             TimeElapsedColumn(), TextColumn("eta", style="dim"), TimeRemainingColumn(),
             TextColumn("{task.fields[info]}", markup=False, style="cyan"),
             console=CONSOLE, transient=False, disable=not enabled, refresh_per_second=8)
-        self.total = self.progress.add_task(fit("TOTAL"), total=n_files, unit="files", info="")
+        self.n_files, self.files_done = n_files, 0
+        self.total = self.progress.add_task(fit("TOTAL"), total=n_files, unit="files", info="",
+                                            count=f"0/{n_files}")
         self.task, self.t0, self.n_ok, self.n_fail = None, 0.0, 0, 0
         if reviewer:
             reviewer.on_call = self.refresh
@@ -890,13 +896,19 @@ class UI:
             parts.append(f"llm {self.reviewer.calls} · flagged {self.reviewer.flagged}")
         return " · ".join(parts)
 
-    def start(self, name, total, unit):
+    def start(self, name, total, unit, where=None):
+        """The bar runs to `total` records, or - for streamed files, whose record count
+        isn't known up front - to `total` bytes with where() = bytes read so far.
+        The count column always shows records."""
         self.t0 = time.monotonic()
-        self.unit, self.count = unit, total
-        self.task = self.progress.add_task(fit(name), total=max(total, 1), unit=unit, info=self._info())
+        self.unit, self.count, self.where = unit, 0, where
+        self.task = self.progress.add_task(fit(name), total=max(total, 1), unit=unit, count="0",
+                                           info=self._info())
 
     def advance(self, n=1):
-        self.progress.update(self.task, advance=n, info=self._info())
+        self.count += n
+        pos = {"completed": self.where()} if self.where else {"advance": n}
+        self.progress.update(self.task, count=f"{self.count:,}", info=self._info(), **pos)
 
     def refresh(self):
         if self.task is not None:
@@ -918,14 +930,18 @@ class UI:
         self._line("✗", "red", name, why)
 
     def skip(self, name, why):
-        self.progress.advance(self.total)
+        self._tick_total()
         self._line("–", "yellow", name, why)
 
     def _close_task(self):
         if self.task is not None:
             self.progress.remove_task(self.task)
             self.task = None
-        self.progress.advance(self.total)
+        self._tick_total()
+
+    def _tick_total(self):
+        self.files_done += 1
+        self.progress.update(self.total, advance=1, count=f"{self.files_done}/{self.n_files}")
 
 # ---------- delimiter detection ----------
 def detect_delimiter(sample, suf):
@@ -950,6 +966,131 @@ def detect_delimiter(sample, suf):
         if best_score is None or score > best_score:
             best, best_score = d, score
     return best
+
+# ---------- streaming readers: one record in memory, never the whole file ----------
+_JSON_WS = re.compile(r"[ \t\n\r]*")
+
+class JsonStream:
+    """Pull parser for the outer levels of a JSON document read from a text stream.
+    Objects and arrays are entered key by key / element by element; every other
+    value (and every array element) is decoded on its own with raw_decode, so a
+    multi-GB {"value": [...]} export never has to fit in memory."""
+
+    def __init__(self, fh, chunk=1 << 20):
+        self.fh, self.chunk, self.buf, self.pos, self.eof = fh, chunk, "", 0, False
+        self.dec = json.JSONDecoder()
+
+    def _more(self):
+        # read at least as much as is buffered: a record larger than the chunk is
+        # re-decoded O(log size) times instead of once per chunk
+        data = self.fh.read(max(self.chunk, len(self.buf) - self.pos))
+        self.buf, self.pos, self.eof = self.buf[self.pos:] + data, 0, not data
+        return bool(data)
+
+    def peek(self):
+        """Next non-blank character, not consumed ('' at the end of the input)."""
+        while True:
+            self.pos = _JSON_WS.match(self.buf, self.pos).end()
+            if self.pos < len(self.buf):
+                return self.buf[self.pos]
+            if not self._more():
+                return ""
+
+    def take(self, ch):
+        c = self.peek()
+        if c != ch:
+            raise ValueError(f"invalid JSON: expected {ch!r}, found {c or 'end of file'!r}")
+        self.pos += 1
+
+    def value(self):
+        self.peek()
+        while True:
+            try:
+                v, end = self.dec.raw_decode(self.buf, self.pos)
+                # a number may go on in the next chunk ('-0.5' + 'e-7'): need 3 chars after it
+                if len(self.buf) - end >= 3 or self.eof:
+                    self.pos = end
+                    return v
+            except json.JSONDecodeError as e:
+                # a value cut off by the buffer fails at its end (or as an unterminated string)
+                if self.eof or (e.pos < len(self.buf) - 8 and not e.msg.startswith("Unterminated")):
+                    raise
+            self._more()
+
+    def elements(self):
+        """Iterate an array; the caller consumes each element (value() or nested)."""
+        self.take("[")
+        if self.peek() == "]":
+            self.pos += 1
+            return
+        while True:
+            yield
+            if self._close("]"):
+                return
+
+    def keys(self):
+        """Iterate an object's keys; the caller consumes each value."""
+        self.take("{")
+        if self.peek() == "}":
+            self.pos += 1
+            return
+        while True:
+            k = self.value()
+            self.take(":")
+            yield k
+            if self._close("}"):
+                return
+
+    def _close(self, end):
+        c = self.peek()
+        if c not in (",", end):
+            raise ValueError(f"invalid JSON: expected ',' or {end!r}, found {c or 'end of file'!r}")
+        self.pos += 1
+        return c == end
+
+    def finish(self):
+        if self.peek():
+            raise ValueError("invalid JSON: extra data after the document")
+
+def json_dump_at(v, depth):
+    """json.dumps(v, indent=2) as it reads nested `depth` levels deep, so streamed
+    output is laid out exactly like a whole-document dump."""
+    return json.dumps(v, ensure_ascii=False, indent=2).replace("\n", "\n" + "  " * depth)
+
+def is_ndjson(fh, cap=1 << 24):
+    """JSON lines saved as .json: the first non-blank line is a complete JSON value
+    and more follows. Reads at most a couple of lines, then rewinds."""
+    try:
+        lines = iter(lambda: fh.readline(cap), "")
+        first = next((l for l in lines if l.strip()), "")
+        if len(first) >= cap:                      # one huge line: a minified document
+            return False
+        try:
+            json.loads(first)
+        except ValueError:
+            return False
+        return any(l.strip() for l in lines)
+    finally:
+        fh.seek(0)
+
+def xlsx_rows(ws):
+    """Rows of a read-only (streamed) worksheet as value lists ('' -> None, control
+    characters made safe). Empty rows are only passed on when a non-empty row
+    follows, so sheets formatted down to row 1,048,576 don't end in blank rows."""
+    ws.reset_dimensions()                          # a wrong <dimension> would cut rows off
+    gap = 0
+    for row in ws.iter_rows(values_only=True):
+        vals = [None if v == "" else xl_safe(v) for v in row]
+        if not _nonempty(vals):
+            gap += 1
+            continue
+        yield from itertools.repeat([], gap)
+        gap = 0
+        yield vals
+
+def open_xlsx_stream(path):
+    from openpyxl import load_workbook
+    return load_workbook(path, read_only=True, data_only=True)  # formulas -> cached values
 
 # ---------- pre-scan: learn identifiers from identity columns of all inputs ----------
 def prescan(jobs, lexicon, cancel_ok=True):
@@ -1009,26 +1150,39 @@ def prescan(jobs, lexicon, cancel_ok=True):
                     header = next(rd, [])
                     take(label, header, rd)
             elif suf in (".xlsx", ".xlsm"):
-                from python_calamine import CalamineWorkbook
-                book = CalamineWorkbook.from_path(str(f))
-                for meta in book.sheets_metadata:
-                    if not str(meta.typ).endswith(".WorkSheet"):
-                        continue
-                    rows = book.get_sheet_by_name(meta.name).to_python(skip_empty_area=False)
-                    h = next((i for i, r in enumerate(rows) if _nonempty(r)), None)
-                    if h is not None:
-                        take(f"{label} › {meta.name}", [str(x) for x in rows[h]], rows[h + 1:])
-            elif suf in (".ndjson", ".jsonl", ".json"):
-                raw = f.read_text(encoding="utf-8-sig", errors="replace")
+                book = open_xlsx_stream(f)
                 try:
-                    walk(json.loads(raw))
-                except ValueError:
-                    for line in raw.splitlines():
-                        if line.strip():
-                            try:
-                                walk(json.loads(line))
-                            except ValueError:
-                                pass
+                    for ws in book.worksheets:
+                        rows = (r for r in xlsx_rows(ws) if r)
+                        header = next(rows, None)
+                        if header is not None:
+                            take(f"{label} › {ws.title}", ["" if x is None else str(x) for x in header], rows)
+                finally:
+                    book.close()
+            elif suf in (".ndjson", ".jsonl", ".json"):
+                with f.open("r", encoding="utf-8-sig", errors="replace", newline="") as fh:
+                    if suf != ".json" or is_ndjson(fh):
+                        for line in fh:
+                            if line.strip():
+                                try:
+                                    walk(json.loads(line))
+                                except ValueError:
+                                    pass
+                    else:
+                        js, rest = JsonStream(fh), {}
+                        if js.peek() == "{":            # Azure {"value": [...]}: one record at a time
+                            for k in js.keys():
+                                if js.peek() == "[":
+                                    for _ in js.elements():
+                                        walk(js.value(), (k,))
+                                else:
+                                    rest[k] = js.value()
+                            walk(rest)
+                        elif js.peek() == "[":
+                            for _ in js.elements():
+                                walk(js.value())
+                        else:
+                            walk(js.value())
         except Exception:
             pass                      # the real pass will report a broken file
     return seen_cols
@@ -1068,68 +1222,75 @@ def xlsx_sheet_mb(path):
         return 0.0
 
 XL_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+XL_ESCAPE = re.compile(r"_x([0-9A-Fa-f]{4})_")
 
 def xl_safe(v):
-    """openpyxl refuses control characters in cells (Excel stores them as _xHHHH_
-    escapes, which calamine / openpyxl decode on read); replace them with U+FFFD
-    before scrubbing, so names split by them are still matched."""
-    return XL_ILLEGAL.sub("\ufffd", v) if isinstance(v, str) else v
+    """Excel stores control characters as _xHHHH_ escapes (CR as _x000D_), which
+    openpyxl leaves as they are: decode them, so '10.1.2.3_x000D_' is still an IP
+    to the rules. openpyxl refuses control characters in cells, so those become
+    U+FFFD before scrubbing and names split by them are still matched."""
+    if not isinstance(v, str):
+        return v
+    if "_x" in v:
+        v = XL_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), v)
+    return XL_ILLEGAL.sub("\ufffd", v)
 
 def process_xlsx(path, out, anon, ui, full_max_mb):
     """Small books: full-fidelity in-place scrub. Large books (or sheets formatted
-    down to row 1,048,576): fast calamine read + streaming write, values only."""
+    down to row 1,048,576): streaming read + streaming write, values only."""
     data_mb = xlsx_sheet_mb(path)
     if data_mb <= full_max_mb:
         return process_xlsx_full(path, out, anon, ui)
     return process_xlsx_fast(path, out, anon, ui, data_mb)
 
 def process_xlsx_fast(path, out, anon, ui, size_mb):
+    """openpyxl read-only mode parses one row at a time and write-only mode spools
+    rows to disk, so memory stays flat however large the sheets are (only the
+    shared-strings table is held)."""
     from openpyxl import Workbook
     from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font
-    from python_calamine import CalamineWorkbook
-    bold, sheets, total = Font(bold=True), [], 0
-    with CONSOLE.status(f"reading {path.name} ({size_mb:,.0f} MB of sheet data) ...", spinner="dots") as st:
-        book = CalamineWorkbook.from_path(str(path))
-        for meta in book.sheets_metadata:
-            if not str(meta.typ).endswith(".WorkSheet"):
-                continue
-            st.update(f"reading {path.name} ({size_mb:,.0f} MB of sheet data) › sheet '{meta.name}' ...")
-            rows = book.get_sheet_by_name(meta.name).to_python(skip_empty_area=False)
-            sheets.append((meta.name, not str(meta.visible).endswith(".Visible"), rows))
-            total += len(rows)
-    ui.start(path.name, total, "rows")
-    wb, cells = Workbook(write_only=True), 0
-    wb.properties.creator = wb.properties.lastModifiedBy = "anonymized"
-    for name, hidden, rows in sheets:
-        ws = wb.create_sheet(apply_rules(name, anon.rules)[:31])
-        if hidden:
-            ws.sheet_state = "hidden"
-        header = None
-        for row in rows:
-            ui.advance()
-            vals = [None if v == "" else xl_safe(v) for v in row]
-            if header is None:
-                if _nonempty(vals):
-                    header = [str(v) if v is not None else None for v in vals]
-                    hc = []
-                    for v in vals:
-                        c = WriteOnlyCell(ws, value=apply_rules(v, anon.rules) if isinstance(v, str) else v)
-                        c.font = bold; hc.append(c)
-                    ws.append(hc)
-                else:
-                    ws.append([])
-                continue
-            outrow = []
-            for i, v in enumerate(vals):
-                if isinstance(v, str) and v:
-                    v = anon.scrub_str(v, header[i] if i < len(header) else None)
-                    cells += 1
-                outrow.append(v)
-            ws.append(outrow)
-    wb.save(out.with_suffix(".xlsx") if out.suffix.lower() == ".xlsm" else out)
-    note = f"{len(sheets)} sheet(s), {cells:,} cells, fast mode: values only"
+    bold, cells = Font(bold=True), 0
+    book = open_xlsx_stream(path)
+    try:
+        sheets = book.worksheets                   # includes hidden sheets, not chart sheets
+        ui.start(path.name, sum(ws.max_row or 0 for ws in sheets), "rows")  # from <dimension>: an estimate
+        wb = Workbook(write_only=True)
+        wb.properties.creator = wb.properties.lastModifiedBy = "anonymized"
+        for src in sheets:
+            ws = wb.create_sheet(apply_rules(src.title, anon.rules)[:31])
+            if src.sheet_state != "visible":
+                ws.sheet_state = "hidden"
+            header = None
+            for vals in xlsx_rows(src):
+                ui.advance()
+                if header is None:
+                    if vals:
+                        header = [str(v) if v is not None else None for v in vals]
+                        hc = []
+                        for v in vals:
+                            c = WriteOnlyCell(ws, value=apply_rules(v, anon.rules) if isinstance(v, str) else v)
+                            c.font = bold; hc.append(c)
+                        ws.append(hc)
+                    else:
+                        ws.append([])
+                    continue
+                outrow = []
+                for i, v in enumerate(vals):
+                    if isinstance(v, str) and v:
+                        v = anon.scrub_str(v, header[i] if i < len(header) else None)
+                        cells += 1
+                    outrow.append(v)
+                ws.append(outrow)
+        wb.save(xlsx_out(out))
+    finally:
+        book.close()
+    note = f"{len(sheets)} sheet(s), {cells:,} cells, {size_mb:,.0f} MB streamed: values only"
     return note + (", -> .xlsx" if path.suffix.lower() == ".xlsm" else "")
+
+def xlsx_out(out):
+    """Values-only books can't carry macros: .xlsm is written as .xlsx."""
+    return out.with_suffix(".xlsx") if out.suffix.lower() == ".xlsm" else out
 
 def process_xlsx_full(path, out, anon, ui):
     """Every sheet: first non-empty row = header (used for identity-field
@@ -1185,30 +1346,36 @@ def process_xlsx_full(path, out, anon, ui):
         note += f", dropped {stats['pivots']} pivot table(s) (they cache raw data)"
     return note
 
-def walk_json_top(data, anon, ui, name):
-    """Walk a JSON document advancing the bar per record: per element of a
-    top-level array, or per element of any array directly under a top-level
-    object (Azure {"value": [...]}, {"records": [...]} ...)."""
-    if isinstance(data, list):
-        ui.start(name, len(data), "records")
-        res = []
-        for v in data:
-            res.append(anon.walk(v)); ui.advance()
-        return res
-    if isinstance(data, dict):
-        ui.start(name, sum(len(v) if isinstance(v, list) else 1 for v in data.values()), "records")
-        res = {}
-        for k, v in data.items():
-            if isinstance(v, list):
-                res[k] = []
-                for x in v:
-                    res[k].append(anon.walk(x, k, path=(k,))); ui.advance()
+def anonymize_json_stream(fh, f, anon, ui):
+    """Stream a JSON document record by record: the elements of a top-level array,
+    or of the arrays directly under a top-level object (Azure {"value": [...]},
+    {"records": [...]} ...). Output is laid out like json.dumps(indent=2)."""
+    js = JsonStream(fh)
+
+    def array(depth, key=None):
+        ind, n = "\n" + "  " * (depth + 1), 0
+        f.write("[")
+        for _ in js.elements():
+            f.write(("," if n else "") + ind + json_dump_at(anon.walk(js.value(), key, path=(key,) if key else ()), depth + 1))
+            n += 1; ui.advance()
+        f.write("\n" + "  " * depth + "]" if n else "]")
+
+    if js.peek() == "[":
+        array(0)
+    elif js.peek() == "{":
+        f.write("{")
+        n = 0
+        for k in js.keys():                         # top-level keys are kept as they are
+            f.write(("," if n else "") + "\n  " + json.dumps(k, ensure_ascii=False) + ": ")
+            n += 1
+            if js.peek() == "[":
+                array(1, k)
             else:
-                res[k] = anon.walk(v, k, path=(k,)); ui.advance()
-        return res
-    ui.start(name, 1, "values")
-    res = anon.walk(data); ui.advance()
-    return res
+                f.write(json_dump_at(anon.walk(js.value(), k, path=(k,)), 1)); ui.advance()
+        f.write("\n}" if n else "}")
+    else:
+        f.write(json_dump_at(anon.walk(js.value()), 0)); ui.advance()
+    js.finish()
 
 SUPPORTED = {".csv", ".tsv", ".tab", ".psv", ".ndjson", ".jsonl", ".json",
              ".log", ".txt", ".xlsx", ".xlsm"}
@@ -1261,51 +1428,51 @@ def process_file(path, out, anon, ui, xlsx_full_max_mb=40.0, label=None):
         return ui.skip(name, "compressed - decompress first (or sample it with sample_files.py)")
     if suf in (".xlsx", ".xlsm"):
         return ui.finish(name, process_xlsx(path, out, anon, ui, xlsx_full_max_mb))
-    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as fh:
-        raw = fh.read()                                   # newline="" keeps \r\n vs \n intact
-    if suf in (".csv", ".tsv", ".tab", ".psv"):
-        delim = detect_delimiter(raw[:262144], suf)       # ',' ';' tab '|' - by parse consistency
-        eol = "\r\n" if "\r\n" in raw[:65536] else "\n"
-        rows = list(csv.reader(io.StringIO(raw, newline=""), delimiter=delim))  # multi-line cells ok
-        header = rows[0] if rows else []
-        ui.start(name, max(len(rows) - 1, 0), "rows")
-        res = [header]
-        for r in rows[1:]:
-            res.append([anon.scrub_str(c, header[i] if i < len(header) else None)
-                        for i, c in enumerate(r)])
-            ui.advance()
-        with out.open("w", newline="", encoding="utf-8") as f:
-            csv.writer(f, delimiter=delim, lineterminator=eol).writerows(res)
-    elif suf in (".log", ".txt"):
-        lines = raw.splitlines(keepends=True)
-        ui.start(name, len(lines), "lines")
-        with out.open("w", encoding="utf-8", newline="") as f:
-            for l in lines:
-                body = l.rstrip("\r\n")
-                f.write(anon.scrub_str(body) + l[len(body):] if body.strip() else l)
-                ui.advance()
-    elif suf in (".ndjson", ".jsonl") or (suf == ".json" and _is_ndjson(raw)):
-        lines = [l for l in raw.splitlines() if l.strip()]
-        ui.start(name, len(lines), "records")
-        res = []
-        for l in lines:
-            res.append(json.dumps(anon.walk(json.loads(l)), ensure_ascii=False, separators=(",", ":")))
-            ui.advance()
-        out.write_text("\n".join(res) + "\n", encoding="utf-8")
-    elif suf == ".json":
-        data = walk_json_top(json.loads(raw), anon, ui, name)
-        out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    else:
-        ui.start(name, 1, "file")
-        out.write_text(anon.scrub_str(raw), encoding="utf-8")
-        ui.advance()
+    # text formats: streamed record by record; the bar follows the bytes read
+    size = path.stat().st_size
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as fh:  # newline="" keeps \r\n
+        where = fh.buffer.tell
+        if suf in (".csv", ".tsv", ".tab", ".psv"):
+            head = fh.read(262144); fh.seek(0)
+            delim = detect_delimiter(head, suf)               # ',' ';' tab '|' - by parse consistency
+            eol = "\r\n" if "\r\n" in head[:65536] else "\n"
+            rows = csv.reader(fh, delimiter=delim)             # multi-line cells ok
+            header = next(rows, [])
+            ui.start(name, size, "rows", where)
+            with out.open("w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f, delimiter=delim, lineterminator=eol)
+                w.writerow(header)
+                for r in rows:
+                    w.writerow([anon.scrub_str(c, header[i] if i < len(header) else None)
+                                for i, c in enumerate(r)])
+                    ui.advance()
+        elif suf in (".ndjson", ".jsonl") or (suf == ".json" and is_ndjson(fh)):
+            ui.start(name, size, "records", where)
+            with out.open("w", encoding="utf-8") as f:
+                for l in fh:
+                    if l.strip():
+                        f.write(json.dumps(anon.walk(json.loads(l)), ensure_ascii=False,
+                                           separators=(",", ":")) + "\n")
+                        ui.advance()
+        elif suf == ".json":
+            ui.start(name, size, "records", where)
+            with out.open("w", encoding="utf-8") as f:
+                anonymize_json_stream(fh, f, anon, ui)
+        else:                                                 # .log, .txt and anything else: per line
+            ui.start(name, size, "lines", where)
+            with out.open("w", encoding="utf-8", newline="") as f:
+                for l in fh:
+                    body = l.rstrip("\r\n")
+                    f.write(anon.scrub_str(body) + l[len(body):] if body.strip() else l)
+                    ui.advance()
     ui.finish(name)
 
-def _is_ndjson(raw):
-    try:
-        json.loads(raw); return False
-    except ValueError:
-        return True
+def remove_partial(dst):
+    for p in {dst, xlsx_out(dst)}:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1422,6 +1589,7 @@ def main():
                         state["done"] += 1
                     except Exception as e:
                         state["current"] = None
+                        remove_partial(dst)            # streamed output stops where the error was
                         if a.verbose:
                             raise
                         ui.fail(label, f"{type(e).__name__}: {e}"[:200])
@@ -1445,11 +1613,8 @@ def main():
                 pass
         CONSOLE.show_cursor(True)
         cur = state["current"]
-        if cur is not None and cur.exists():          # half-written output: never leave it behind
-            try:
-                cur.unlink()
-            except OSError:
-                pass
+        if cur is not None:                           # half-written output: never leave it behind
+            remove_partial(cur)
         rv = state["reviewer"]
         if rv is not None and rv.report:
             try:

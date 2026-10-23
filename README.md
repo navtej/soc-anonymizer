@@ -30,5 +30,5 @@ Check the `identity columns [...]` lines at the start of each run; fix misses wi
 ## Tests
 
 ```bash
-uv run --with pytest --with rich --with openpyxl --with python-calamine pytest -q tests
+uv run --with pytest --with rich --with openpyxl pytest -q tests
 ```

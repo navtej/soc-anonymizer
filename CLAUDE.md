@@ -33,9 +33,8 @@ LLM, and that includes you (Claude Code sends everything you read or run to the 
 - Python scripts are **self-contained uv scripts** with PEP 723 inline dependencies
   (`# /// script` header). Keep it that way; no requirements.txt / pyproject for the scripts.
   Run them with `uv run soc_anonymize.py …`.
-- No new heavy dependencies without a reason. Current: `gliner2[local]`, `openpyxl`,
-  `python-calamine`, `rich`.
-- Tests: `uv run --with pytest --with rich --with openpyxl --with python-calamine pytest -q tests`
+- No new heavy dependencies without a reason. Current: `gliner2[local]`, `openpyxl`, `rich`.
+- Tests: `uv run --with pytest --with rich --with openpyxl pytest -q tests`
   (≈10 s; they use `--no-ner` and a stub model, so no model download). Run them after every change
   and add a test for every bug fixed.
 
@@ -85,14 +84,21 @@ but not chased through free text. Sentinel entity objects (`{"Type": "account", 
 - Look-alike attacker domains (IOCs) are not added as internal domains.
 
 ### Robustness features (don't regress)
+- **Streaming, never whole files**: CSV/TSV rows, log lines, NDJSON records and the records of a
+  JSON document (top-level array, or arrays under a top-level object like Azure `{"value": [...]}`)
+  are read, scrubbed and written one at a time. `JsonStream` is a small stdlib pull parser
+  (`raw_decode` per element); output keeps the `json.dumps(indent=2)` layout. Progress for text
+  files follows bytes read. A failed file's partial output is removed.
 - **Ctrl-C is immediate**: work runs in a worker thread (`run_cancellable`); main thread waits,
   on Ctrl-C removes the half-written output, flushes reports/map, exits 130.
 - **NER input is bounded**: `chunks()` splits ≤1000 chars (also inside long single lines),
   `max_len=384`, blob-like text (base64/hex) skips NER. Unbounded input once stalled a run.
 - **Large XLSX**: decided by *uncompressed sheet XML size* (`xlsx_sheet_mb`, default 40 MB):
   small → full-fidelity openpyxl (formatting, comments, links, formulas' string literals, metadata
-  scrubbed, pivot caches dropped); large → calamine read + write-only, values only.
-  Rows that only carry formatting are ignored (sheets formatted to row 1,048,576).
+  scrubbed, pivot caches dropped); large → openpyxl read-only (row streaming) + write-only,
+  values only, flat memory (only shared strings are held). `_xHHHH_` escapes (e.g. `_x000D_`)
+  are decoded before scrubbing. Trailing rows that only carry formatting are dropped (sheets
+  formatted to row 1,048,576). The prescan streams XLSX the same way.
 - **Delimiter detection** by parse consistency (`detect_delimiter`), not `csv.Sniffer`; line
   endings and BOM preserved.
 - Library noise suppressed (`quiet_ml_libs`, `--verbose` to see it); rich progress bars.
@@ -109,7 +115,8 @@ but not chased through free text. Sentinel entity objects (`{"Type": "account", 
 Exact `ceil(N·p%)` random records per file/sheet (`-p`, default 10), `--seed` for reproducibility
 (per-file RNG from seed + path), `--min-rows/--max-rows`, folders recursive, `.gz` input,
 `sample_manifest.json`. JSON: samples the largest array (Azure `value`, Elastic `hits.hits`) and
-fixes `count`-style fields. XLSX: same full/fast split as above. Same Ctrl-C handling.
+fixes `count`-style fields. Every format is streamed in two passes (count, then write the picks),
+JSON included. XLSX: same full/streamed split as above. Same Ctrl-C handling.
 
 ## Known gaps / ideas (not done yet)
 - Anonymizer can't read `.gz` directly (sampler can).
