@@ -172,7 +172,9 @@ def test_weak_variants_only_when_name_cased(tmp_path):
 @pytest.mark.parametrize("text", [
     "plain priya.sharma@acmeholdings.com end", "Priya.Sharma@AcmeHoldings.COM",
     "url ?u=priya.sharma%40acmeholdings.com&x=1", "defanged priya.sharma[@]acmeholdings[.]com",
-    "spoken priya.sharma (at) acmeholdings (dot) com", "SMTP:Priya.Sharma@acmeholdings.com;"])
+    "spoken priya.sharma (at) acmeholdings (dot) com", "SMTP:Priya.Sharma@acmeholdings.com;",
+    "html priya.sharma&#64;acmeholdings.com", r"json \npriya.sharma@acmeholdings.com",
+    r"json \u003cpriya.sharma@acmeholdings.com\u003e", r"escaped priya.sharma\u0040acmeholdings.com"])
 def test_email_forms_share_one_token(text):
     sa = load_module()
     an = sa.Anonymizer(sa.build_rules([]))
@@ -193,7 +195,10 @@ def test_email_lookalikes_untouched(text):
     ("WorkspaceSubscriptionId", "SUBSCRIPTIONID"), ("WorkspaceResourceGroup", "RG"),
     ("SourceComputerId", "HOSTID"), ("VendorOriginalId", "VENDORID"), ("ProviderName", "PROVIDER"),
     ("VendorName", "VENDOR"), ("SourceSystem", "SYSTEM"), ("CompromisedEntity", "ENTITY"),
-    ("DisplayName", None), ("AlertName", None), ("SystemAlertId", None), ("UserDisplayName", "USER")])
+    ("DisplayName", None), ("AlertName", None), ("SystemAlertId", None), ("UserDisplayName", "USER"),
+    ("account_name", "TENANT"), ("AccountName", "USER"), ("recipient_address", "EMAIL"),
+    ("senderDisplayName", "USER"), ("agentComputerName", "HOST"), ("agentDomain", "DOMAIN"),
+    ("agentLastLoggedInUserName", "USER"), ("original_raw_payload", None), ("alert_json", None)])
 def test_column_classification(header, cat):
     assert load_module().column_category(header) == cat
 
@@ -301,6 +306,32 @@ def test_xlsx_control_characters(tmp_path):
     ws = load_workbook(tmp_path / "out" / "ctrl.xlsx").active
     assert ws.max_row == 11
     assert "\ufffd" in ws["B2"].value
+
+
+# --------------------------------------------------------------------------- SentinelOne
+
+@pytest.mark.parametrize("mode", [[], ["--xlsx-full-max-mb", "0"]], ids=["full", "streamed"])
+def test_sentinelone_xlsx_tenant_emails_and_cut_json(tmp_path, mode):
+    """account_name is the customer; alert_json / original_raw_payload (raw mails, display
+    names, JSON cut off at the cell limit) and recipient_address are scrubbed consistently."""
+    fixtures.build_sentinelone_xlsx(tmp_path / "s1")
+    run(["s1", "-o", "out", "--no-ner", "--map", "out/map.json", *mode], tmp_path)
+    text = all_text(tmp_path / "out")
+    leaks = [s for s in fixtures.S1_SECRETS if s.lower() in text.lower()]
+    assert not leaks, leaks
+    from openpyxl import load_workbook
+    rows = list(load_workbook(tmp_path / "out" / "s1_alerts.xlsx").active.iter_rows(values_only=True))
+    sa = load_module()
+    tenant = sa.pseudo("TENANT", "Acme Holdings")
+    assert {r[2] for r in rows[1:]} == {tenant}
+    assert rows[1][1] == "High" and "Suspicious e-mail link clicked" in rows[1][4]
+    for r in rows[1:3]:                                 # parsed and cut-off JSON: same tenant token
+        assert f'"accountName":"{tenant}"' in r[4].replace(" ", "")
+        assert f'"accountName":"{tenant}"' in r[5].replace(" ", "")
+    assert rows[1][3] == "; ".join(sa.pseudo("EMAIL", e) for e in
+                                   ("priya.sharma@acmeholdings.com", "rahul.verma@acmeholdings.com"))
+    assert sa.pseudo("IPV4", "10.20.5.17") in rows[1][4] and "mx.example.net" in rows[1][5]  # relay kept
+    assert_mapping_sane(json.loads((tmp_path / "out" / "map.json").read_text()))
 
 
 # --------------------------------------------------------------------------- Wazuh / AWS

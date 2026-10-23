@@ -187,17 +187,22 @@ COLUMN_RULES = [
     ("VENDOR",   r"vendor( name)?"),
     ("SYSTEM",   r"source system"),
     ("ENTITY",   r"(compromised|affected|impacted) entit(y|ies)"),
-    ("DOMAIN",   r"upn suffix|nt domain|dns domain|domain( name)?|user domain|account domain"),
+    ("DOMAIN",   r"upn suffix|nt domain|dns domain|domain( name)?|user domain|account domain|agent domain|"
+                 r"login account domain"),
     ("USERID",   r"(assignee|reporter|creator|user|account|actor|caller|owner|analyst|approver|requester|"
                  r"watcher|participant|object|principal)s? id|account id|aad user id|user object id"),
     ("TENANT",   r"(tenant|customer|client|company|organi[sz]ation|org)( (display )?name)?|subscription name"),
-    ("EMAIL",    r"e ?mail( address)?|mail|upn|user principal name|identity|sender|recipient"),
+    ("EMAIL",    r"e ?mail( address)?|mail|upn|user principal name|identity|"
+                 r"(sender|recipients?|reply to|return path|envelope (from|to)|mail from|rcpt to)( e ?mail)?"
+                 r"( address(es)?)?|(agent )?last logged in (upn|user ?mail)"),
     # NB: a bare 'DisplayName' is NOT a user column - in Sentinel it is the alert title.
     ("USER",     r"assignee|reporter|creator|owner|analyst( name)?|approvers?|watchers?|request participants?|"
                  r"user( ?name)?|account( ?name)?|target user ?name|subject user ?name|caller|initiated by|"
                  r"(created|modified|resolved|requested|reviewed|assigned|closed) by|requester|actor|"
-                 r"user display ?name|src user|dst user|employee( name)?|full name"),
-    ("HOST",     r"host( ?name)?|computer( ?name)?|device( ?name)?|workstation( ?name)?|machine( ?name)?|"
+                 r"user display ?name|src user|dst user|employee( name)?|full name|"
+                 r"(sender|recipient|from|to)( display)? name|(agent )?last logged in user( ?name)?|"
+                 r"process user|logins? user ?name"),
+    ("HOST",     r"host( ?name)?|(agent )?computer( ?name)?|device( ?name)?|workstation( ?name)?|machine( ?name)?|"
                  r"src host|dst host|endpoint( name)?|asset( name)?|net ?bios ?name|fqdn"),
 ]
 # Column-only categories: replaced in their own column, but NOT chased through free text
@@ -242,6 +247,10 @@ FIELD_PATHS = {
     "office365.userkey": "USERID", "mailboxownerupn": "EMAIL", "ms-graph.assignedto": "USER",
     "ms-graph.actordisplayname": "USER", "principalemail": "EMAIL", "vminstancename": "HOST",
     "labels.project_id": "TENANT",
+    # SentinelOne: the 'account' is the customer (Defender's AccountName is a user, so only these)
+    "account_name": "TENANT", "site_name": "TENANT",
+    **{f"{p}.{k}": "TENANT" for p in ("agentrealtimeinfo", "agentdetectioninfo")
+       for k in ("accountname", "sitename")},
 }
 
 # Sentinel / Defender entity objects ({"Type": "account", "Name": ..., "UPNSuffix": ...}):
@@ -348,10 +357,17 @@ def column_category(header, path=()):
 STOP_TERMS = {"unassigned", "none", "null", "n/a", "na", "nil", "-", "--", "unknown", "system", "admin",
               "administrator", "automation for jira", "jira", "service desk", "internal", "test", "default",
               "true", "false", "yes", "no", "high", "low", "medium", "critical", "open", "closed",
-              "root", "nobody", "ec2-user", "ubuntu"}
+              "root", "nobody", "ec2-user", "ubuntu", "workgroup"}
 CORP_SUFFIX = re.compile(r"[\s,.]+(private|pvt\.?|ltd\.?|limited|inc\.?|incorporated|corp\.?|corporation|"
                          r"llc|l\.l\.c\.|llp|plc|gmbh|ag|sa|bv|co\.?|company|group|holdings?|"
                          r"technologies|technology|tech|solutions|services|systems|india|global)\.?$", re.I)
+
+def tenant_core(v):
+    """'Acme Holdings Pvt Ltd' -> 'Acme Holdings'."""
+    core = v
+    while CORP_SUFFIX.search(core):
+        core = CORP_SUFFIX.sub("", core).strip()
+    return core
 
 class Lexicon:
     """Values seen in identity columns (assignees, tenants, issue keys, account ids ...)
@@ -364,6 +380,7 @@ class Lexicon:
         self.key_prefixes = set()  # Jira project keys, e.g. MSSOC
         self.domains = set()       # internal domains (UPNSuffix, DnsDomain, --domains ...)
         self.email_domains = set() # domains seen in internal mailbox / UPN values
+        self.tenants = set()       # tenant names (their squashed form marks internal mail domains)
         self.counts = {}
         self.rx = None
 
@@ -377,7 +394,8 @@ class Lexicon:
         if weak and " " in t:
             weak = False
         old = self.terms.get(t.lower())
-        if old is None or (old[2] and not weak):
+        # a value that is a tenant somewhere (S1 account_name) stays the tenant under 'accountName'
+        if old is None or (old[2] and not weak) or (cat == "TENANT" and old[0] == "USER" and not weak):
             self.terms[t.lower()] = (cat, canon, weak)
 
     def add(self, cat, value):
@@ -391,6 +409,13 @@ class Lexicon:
             self.counts[cat] = self.counts.get(cat, 0) + 1
             return
         cat = resolve_category(cat, v)
+        if cat == "EMAIL" and "@" in v and not EMAIL_RX.fullmatch(v):
+            for e in EMAIL_RX.findall(v):      # 'a@x.com; b@x.com', 'Doe, John <john@x.com>'
+                self.add("EMAIL", e)
+            for _, rx in DISPLAY_NAME_RULES:
+                for name in rx.findall(v):
+                    self.add("USER", " ".join(reversed(name.split(", "))) if ", " in name else name)
+            return
         if cat in COLUMN_ONLY or (v.isdigit() and cat != "AWSACCOUNT"):
             return                          # bare numbers in prose are too ambiguous to chase
         if cat in ("USER", "TENANT", "USERID", "TENANTID", "EMAIL", "HOST", "HOSTID", "SUBSCRIPTIONID",
@@ -415,9 +440,8 @@ class Lexicon:
                 if len(v.split()) == 2:
                     self._put(", ".join(reversed(v.split())), cat, v)     # 'Sharma, Priya'
             if cat == "TENANT":
-                core = v
-                while CORP_SUFFIX.search(core):
-                    core = CORP_SUFFIX.sub("", core).strip()
+                core = tenant_core(v)
+                self.tenants.add(v)
                 self._put(core, cat, v, weak=True)
                 for variant in {core.replace(" ", ""), core.replace(" ", "-"),
                                 core.replace(" ", "_"), v.replace(" ", "")}:
@@ -449,11 +473,13 @@ class Lexicon:
         # domains of internal mailboxes count as internal when they share the registrable
         # label with a known internal domain (attacker look-alike domains stay as IOCs)
         known = {registrable_label(d) for d in self.domains}
+        known |= {re.sub(r"[\W_]+", "", x).lower() for t in self.tenants for x in (t, tenant_core(t))}
         for dom in self.email_domains:
             if registrable_label(dom) in known:
                 self.add_domain(dom)
         for part, fulls in self.names.items():
-            if part in self.terms or part in STOP_TERMS:
+            if part in self.terms or part in STOP_TERMS or \
+                    any(self.terms.get(f.lower(), ("",))[0] == "TENANT" for f in fulls):
                 continue
             if len(fulls) == 1:                 # unique first/last name -> same token as the person
                 self.terms[part] = ("USER", next(iter(fulls)), True)
@@ -517,14 +543,26 @@ def _arn_sub(m):
         parts[i] = pseudo(cat, seg)
     return f"{prefix}{acct or ''}:{''.join(parts)}"
 
+# An address starts after a non-address character or after a JSON escape (\n, \", \u003c) in
+# text that is still JSON-encoded (cells cut off at Excel's limit): '\njohn@x' is 'john@x'.
+EMAIL_START = r"(?:(?<![\w.+'%\\-])|(?<=\\[nrt\"/])|(?<=\\u[0-9a-fA-F]{4}))"
+EMAIL_RX = re.compile(rf"{EMAIL_START}[\w.+'%-]+@[\w-]+(?:\.[\w-]+)+\b")
+# Display names in front of an address: '"Doe, John" <john@x.com>', 'To: John Doe <john@x.com>'
+_ADDR_AHEAD = r"\s*(?:<|&lt;|\\u003[cC])(?=[\w.+'%-]+@)"
+DISPLAY_NAME_RULES = [
+    ("USER", re.compile(rf'\\?"([^"\\\r\n<>@]{{1,80}}?)\\?"{_ADDR_AHEAD}')),
+    ("USER", re.compile(rf"(?:(?<![\w.'-])|(?<=\\[nrt]))([A-Z][\w.'-]*(?:,? [A-Z][\w.'-]*){{0,3}}){_ADDR_AHEAD}")),
+]
+
 def build_rules(domains):
     rules = [
         ("SECRET", re.compile(r"\beyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}\b")),             # JWT
         ("SECRET", re.compile(r"(?i)\b(?:password|passwd|pwd|secret|token|apikey|api_key|sig)=([^&\s\"']+)")),
         # defanged / URL-encoded: john%40acme.com, john[@]acme[.]com, john (at) acme (dot) com
-        ("EMAIL_OBF", re.compile(r"(?i)\b([\w.+'-]+)\s?(?:%40|\[@\]|\(@\)|\[at\]|\(at\)|\{at\})\s?"
+        ("EMAIL_OBF", re.compile(rf"(?i){EMAIL_START}([\w.+'-]+)\s?(?:%40|\[@\]|\(@\)|\[at\]|\(at\)|\{{at\}}|"
+                                 r"&#64;|&#x40;|\\u0040|\\x40|＠)\s?"
                                  r"([\w-]+(?:\s?(?:\.|\[\.\]|\(\.\)|\[dot\]|\(dot\)|%2e)\s?[\w-]+)+)\b")),
-        ("EMAIL", re.compile(r"\b[\w.+'%-]+@[\w-]+(?:\.[\w-]+)+\b")),
+        ("EMAIL", EMAIL_RX),
         # Azure resource paths and portal links
         ("SUBSCRIPTIONID", re.compile(r"(?i)(?:/subscriptions/|subscriptionId[/=])"
                                       r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")),
@@ -553,6 +591,7 @@ def build_rules(domains):
         ("USER", re.compile(r"(?i)(?<=[\\/]users[\\/])[^\\/\s\"']+")),                     # C:\Users\x, /Users/x
         ("USER", re.compile(r"(?i)(?<=/home/)[^/\s\"']+")),
         ("USER", re.compile(r"\b[A-Z][A-Z0-9-]{1,14}\\([A-Za-z0-9._$-]{2,})\b")),         # DOMAIN\user
+        *DISPLAY_NAME_RULES,
     ]
     if domains:
         d = "|".join(re.escape(x) for x in domains)
@@ -609,6 +648,10 @@ LABEL_CAT = {
 NER_LABELS = list(LABEL_CAT)
 # the model card notes it over-predicts names -> stricter threshold for name labels
 NAME_LABELS = {"person", "full_name", "first_name", "last_name"}
+# "key": "value" pairs (also \"key\": \"value\" one level down) in JSON that doesn't parse,
+# e.g. alert payloads cut off at Excel's 32,767-character cell limit. Values with escapes are
+# left to the free-text rules.
+KV_RX = re.compile(r'(\\?)"([A-Za-z_@$][\w.@$-]{0,63})\1"\s*:\s*\1"([^"\\]{1,500})\1"')
 TOKEN_RX = re.compile(r"\b(?:[A-Z]+_[0-9a-f]{8}|user_[0-9a-f]{8}@example\.com|TKT-\d{7})\b")
 
 def prefetch_model(model_name):
@@ -806,7 +849,10 @@ class Anonymizer:
             return self.lexicon.apply(s) if " " in s.strip() else pseudo(cat, s.upper())
         if cat == "DOMAIN":
             return pseudo("DOMAIN", s.strip().lower())
-        return pseudo(resolve_category(cat, s), s)
+        cat = resolve_category(cat, s)
+        if cat == "USER" and self.lexicon.terms.get(s.strip().lower(), ("",))[0] == "TENANT":
+            return pseudo("TENANT", self.lexicon.terms[s.strip().lower()][1])
+        return pseudo(cat, s)
 
     def scrub_key(self, k):
         """JSON keys can carry PII too ({"rahul@acme.com": ...}); no NER, rules + lexicon only."""
@@ -822,10 +868,11 @@ class Anonymizer:
                 return json.dumps(self.walk(json.loads(t), path=inner), ensure_ascii=False,
                                   separators=(",", ":"))
             except ValueError:
-                pass
+                s = KV_RX.sub(self._kv_sub, s)        # cut-off JSON: still honour "key": "value" fields
         cat = column_category(key) if cat is None else cat
-        if cat and t and resolve_category(cat, t):     # None: public AWS endpoint -> free text
-            return self.pseudo_field(cat, s)
+        rc = resolve_category(cat, t) if cat and t else None   # None: public AWS endpoint -> free text
+        if rc and not (rc == "EMAIL" and "@" in t and not EMAIL_RX.fullmatch(t)):
+            return self.pseudo_field(cat, s)          # (several addresses / display names: free text)
         s = apply_rules(s, self.email_rules)  # whole e-mail addresses first (also defanged / %40)
         s = self.lexicon.apply(s)             # known names / tenants / keys -> same tokens as their columns
         s = apply_rules(s, self.other_rules)
@@ -834,6 +881,15 @@ class Anonymizer:
         if self.reviewer:
             s = self.reviewer(s)
         return s
+
+    def _kv_sub(self, m):
+        k, v = m.group(2), m.group(3)
+        known = self.lexicon.terms.get(v.lower())     # same token as the parsed JSON / columns gave it
+        if known and not known[2]:
+            return m.group(0).replace(v, pseudo(known[0], known[1]))
+        if not column_category(k):
+            return m.group(0)
+        return m.group(0).replace(v, self.scrub_str(v, k))
 
     def walk(self, obj, key=None, cat=None, path=()):
         """path: keys from the document root ('_source', 'agent'), for dotted FIELD_PATHS."""
@@ -1116,8 +1172,11 @@ def prescan(jobs, lexicon, cancel_ok=True):
     def walk_str(v, path=()):
         try:
             walk(json.loads(v), path)
-        except ValueError:
-            pass
+        except ValueError:                        # cut off: learn its "key": "value" fields
+            for m in KV_RX.finditer(v):
+                c = column_category(m.group(2))
+                if c:
+                    lexicon.add(c, m.group(3))
 
     def walk(obj, path=()):
         if isinstance(obj, dict):
@@ -1574,7 +1633,8 @@ def main():
         if a.no_lexicon:
             lexicon = Lexicon()
         log(lexicon.compile().summary())
-        anon = Anonymizer(build_rules([d.strip() for d in a.domains.split(",") if d.strip()]), ner,
+        # internal domains: --domains plus those learnt (UPN suffixes, agent domains, mailboxes)
+        anon = Anonymizer(build_rules(sorted(d for d in lexicon.domains if "." in d)), ner,
                           reviewer=reviewer, lexicon=lexicon)
         try:
             with UI(len(jobs), ner, reviewer, enabled=not a.no_progress) as ui:

@@ -308,3 +308,42 @@ def build_streaming_set(folder):
     h.append(["192.168.7.7"])
     wb.save(d / "alerts.xlsx")
     return d
+
+
+# SentinelOne alerts exported to XLSX (snake_case columns; alert_json / original_raw_payload hold
+# JSON, sometimes cut off at Excel's 32,767-char cell limit, and raw e-mail messages).
+S1_SECRETS = ["Acme Holdings", "AcmeHoldings", "acmeholdings", "priya.sharma", "Priya Sharma", "Sharma, Priya",
+              "rahul.verma", "Rahul Verma", "anita.desai", "Anita Desai", "ACME-LT-0042", "10.20.5.17",
+              "billing.globex"]
+S1_ALERT = {
+    "alertInfo": {"name": "Suspicious e-mail link clicked", "severity": "High", "analystVerdict": "undefined"},
+    "agentRealtimeInfo": {"accountName": "Acme Holdings", "siteName": "Acme Holdings - Pune",
+                          "agentComputerName": "ACME-LT-0042", "agentDomain": "corp.acmeholdings.com",
+                          "agentLastLoggedInUserName": "priya.sharma"},
+    "agentDetectionInfo": {"agentIpV4": "10.20.5.17", "agentLastLoggedInUpn": "priya.sharma@acmeholdings.com"},
+    "email": {"recipients": ["priya.sharma@acmeholdings.com", "rahul.verma@acmeholdings.com"],
+              "senderDisplayName": "Anita Desai", "from": "\"Desai, Anita\" <anita.desai@acmeholdings.com>"},
+}
+S1_RAW_MAIL = ("Received: from mail.acmeholdings.com (10.20.5.17) by mx.example.net\r\n"
+               "From: \"Sharma, Priya\" <priya.sharma@acmeholdings.com>\r\n"
+               "To: Rahul Verma <rahul.verma@acmeholdings.com>, billing.globex&#64;globex.example\r\n"
+               "Subject: Invoice overdue\r\n\r\nHi Rahul, see attached. Priya")
+
+
+def build_sentinelone_xlsx(folder):
+    from openpyxl import Workbook
+    d = Path(folder)
+    d.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"event": {"raw": S1_RAW_MAIL, "accountName": "Acme Holdings",
+                                    "user": "priya.sharma", "padding": "x" * 200}})
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["alert_id", "severity", "account_name", "recipient_address", "alert_json", "original_raw_payload"])
+    ws.append(["s1-1", "High", "Acme Holdings", "priya.sharma@acmeholdings.com; rahul.verma@acmeholdings.com",
+               json.dumps(S1_ALERT), payload])
+    ws.append(["s1-2", "Medium", "Acme Holdings", "Rahul Verma <rahul.verma@acmeholdings.com>",
+               json.dumps(S1_ALERT)[:-40], payload[:-60]])        # cut off like Excel's cell limit
+    ws.append(["s1-3", "Low", "Acme Holdings", "anita.desai@acmeholdings.com", S1_RAW_MAIL,
+               "mail from priya.sharma\\u0040acmeholdings.com\\nrahul.verma@acmeholdings.com"])
+    wb.save(d / "s1_alerts.xlsx")
+    return d

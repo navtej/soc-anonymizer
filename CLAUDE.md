@@ -67,6 +67,13 @@ Dotted names (Wazuh/Elastic `_source.agent.name` headers, or the same nesting in
 tracks the key path) are looked up in `FIELD_PATHS` (longest lowercase path suffix wins, `None` = keep,
 e.g. `rule.mail`), else `COLUMN_RULES` on the last segment. HOST values that are IPs get the IP token;
 public AWS endpoints (`ec2.amazonaws.com`, `AWS Internal`) fall through to free text.
+SentinelOne: snake_case `account_name`/`site_name` (and `agentRealtimeInfo.accountName`) are the
+customer → TENANT; a value seen as a tenant anywhere keeps the TENANT token under a generic `accountName`.
+E-mail columns holding several addresses or display names (`Doe, John <j@x>`) go through free text
+(each address + display name tokenized; prescan learns them). JSON that doesn't parse (cut off at
+Excel's 32,767-char limit) still gets its `"key": "value"` identity fields via `KV_RX`. Internal
+domains learnt in the prescan (UPN suffixes, agent domains, mail domains matching a tenant name)
+feed the FQDN host rule, not only `--domains`.
 `COLUMN_ONLY` categories (PROVIDER, VENDOR, SYSTEM, VENDORID, ISSUEID, GEO, AWSTAG, SERIAL) are replaced in their column
 but not chased through free text. Sentinel entity objects (`{"Type": "account", "Name": …}`) use
 `ENTITY_FIELDS` per entity type. Users can override with `--id-columns 'Header=CAT'`,
