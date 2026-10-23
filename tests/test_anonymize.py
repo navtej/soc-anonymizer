@@ -1,6 +1,6 @@
 """Regression tests for soc_anonymize.py - synthetic data only, rules mode (no NER download).
 
-Run:  uv run --with pytest --with rich --with openpyxl --with python-calamine pytest -q tests
+Run:  uv run --with pytest --with rich --with openpyxl pytest -q tests
 """
 import csv
 import importlib.util
@@ -294,10 +294,106 @@ def test_ctrl_c_is_immediate(tmp_path):
 
 
 def test_xlsx_control_characters(tmp_path):
-    """calamine (fast path) decodes _x0000_ to a raw control char openpyxl can't write."""
+    """The streamed path decodes _x0000_ to a raw control char openpyxl can't write."""
     src = fixtures.build_control_chars_xlsx(tmp_path)
     run([src.name, "-o", "out", "--no-ner", "--xlsx-full-max-mb", "0"], tmp_path)
     from openpyxl import load_workbook
     ws = load_workbook(tmp_path / "out" / "ctrl.xlsx").active
     assert ws.max_row == 11
     assert "\ufffd" in ws["B2"].value
+
+
+# --------------------------------------------------------------------------- streaming
+
+def test_json_document_streamed_record_by_record(tmp_path):
+    fixtures.build_streaming_set(tmp_path / "in")
+    run(["in/azure.json", "in/array.json", "-o", "out", "--no-ner", "--map", "out/map.json"], tmp_path)
+    assert_mapping_sane(json.load(open(tmp_path / "out" / "map.json")))
+    for name, n in [("azure.json", 1500), ("array.json", 50)]:
+        text = (tmp_path / "out" / name).read_text(encoding="utf-8")
+        data = json.loads(text)
+        assert text == json.dumps(data, ensure_ascii=False, indent=2), "layout differs from a whole dump"
+        recs = data["value"] if name == "azure.json" else data
+        assert len(recs) == n
+        assert len({r["userPrincipalName"] for r in recs}) == 1          # one token for one original
+        assert all(r["tags"] == [] and r["extra"] == {} and isinstance(r["ok"], bool) for r in recs)
+        assert not any(s in text.lower() for s in ("priya", "acme", "10.20.30.")), name
+    az = json.loads((tmp_path / "out" / "azure.json").read_text())
+    assert list(az) == ["@odata.context", "count", "value", "nextLink"] and az["count"] == 1500
+    assert az["nextLink"] is None
+
+
+def test_ndjson_saved_as_json(tmp_path):
+    fixtures.build_streaming_set(tmp_path / "in")
+    run(["in/lines.json", "-o", "out", "--no-ner"], tmp_path)
+    lines = (tmp_path / "out" / "lines.json").read_text().splitlines()
+    assert len(lines) == 20 and all(json.loads(l)["userPrincipalName"].endswith("@example.com") for l in lines)
+
+
+@pytest.mark.parametrize("script", ["soc_anonymize.py", "sample_files.py"])
+def test_json_stream_parses_exactly_with_bounded_buffer(script):
+    import io
+    spec = importlib.util.spec_from_file_location(script[:-3], ROOT / script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    tricky = [12345678901234567890, -0.5e-7, "quote \" and \\ and \u00e9 \ud83d\ude00", None, True,
+              {"a": [1, {"b": []}], "": {}}, [], "x" * 50, 1e308, "\u2028 line sep"]
+    doc = json.dumps({"head": 1, "value": tricky * 300, "tail": "end"}, ensure_ascii=False)
+    for chunk in (1, 3, 7, 64):
+        js = mod.JsonStream(io.StringIO(doc), chunk=chunk)
+        got, peak, rest = [], 0, {}
+        for k in js.keys():
+            if js.peek() == "[":
+                for _ in js.elements():
+                    got.append(js.value())
+                    peak = max(peak, len(js.buf))
+            else:
+                rest[k] = js.value()
+        js.finish()
+        assert got == tricky * 300 and rest == {"head": 1, "tail": "end"}, chunk
+        assert peak <= 4 * max(chunk, 64), f"buffer grew to {peak} - not streaming"
+    for bad in ('{"a": 1} {"b": 2}', '[1, 2', '[1 2]', '{"a" 1}'):     # extra data, cut off, broken
+        js = mod.JsonStream(io.StringIO(bad), chunk=2)
+        with pytest.raises(ValueError):
+            if js.peek() == "[":
+                for _ in js.elements():
+                    js.value()
+            else:
+                for _ in js.keys():
+                    js.value()
+            js.finish()
+
+
+def test_xlsx_streamed_path(tmp_path):
+    """Large-book path: rows streamed, CRLF escapes decoded before the rules run,
+    formatting-only rows below the data dropped, hidden sheets kept hidden."""
+    fixtures.build_streaming_set(tmp_path / "in")
+    r = run(["in/alerts.xlsx", "-o", "out", "--no-ner", "--xlsx-full-max-mb", "0"], tmp_path)
+    assert "streamed" in r.stderr
+    from openpyxl import load_workbook
+    wb = load_workbook(tmp_path / "out" / "alerts.xlsx")
+    ws, raw = wb["Alerts"], wb["Raw"]
+    assert ws.max_row == 31 and raw.sheet_state == "hidden"
+    assert [c.value for c in ws[1]] == ["Account", "Notes"]
+    cells = [str(c.value) for s in wb.worksheets for row in s.iter_rows() for c in row if c.value]
+    assert not [c for c in cells if "10.1.2." in c or "Priya" in c or "192.168.7.7" in c], cells[:5]
+    assert all("checked by SOC" in str(ws.cell(row=i, column=2).value) for i in range(2, 32))
+
+
+def test_xlsx_crlf_escape_does_not_hide_ips_full_path(tmp_path):
+    """Excel stores CR as _x000D_; '10.1.2.0_x000D_' has no word boundary, so the IP
+    rule used to miss it in the full-fidelity path."""
+    fixtures.build_streaming_set(tmp_path / "in")
+    run(["in/alerts.xlsx", "-o", "out", "--no-ner"], tmp_path)
+    from openpyxl import load_workbook
+    ws = load_workbook(tmp_path / "out" / "alerts.xlsx")["Alerts"]
+    notes = [ws.cell(row=i, column=2).value for i in range(2, 32)]
+    assert not [n for n in notes if "10.1.2." in n or "_x000D_" in n], notes[:3]
+
+
+def test_failed_file_leaves_no_partial_output(tmp_path):
+    good = "".join(json.dumps({"user": f"user{i}", "msg": "x" * 200}) + "\n" for i in range(2000))
+    (tmp_path / "broken.ndjson").write_text(good + "{not json\n" + good)
+    r = run(["broken.ndjson", "-o", "out", "--no-ner"], tmp_path, check=False)
+    assert r.returncode == 1 and "broken.ndjson" in r.stderr
+    assert not (tmp_path / "out" / "broken.ndjson").exists()

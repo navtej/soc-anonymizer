@@ -2,8 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "openpyxl>=3.1",          # .xlsx / .xlsm writing (+ full-fidelity copy of small books)
-#     "python-calamine>=0.2",   # fast .xlsx reading for large workbooks (Rust)
+#     "openpyxl>=3.1",          # .xlsx / .xlsm (large books streamed in read-only mode)
 #     "rich>=13",               # progress display
 # ]
 # ///
@@ -22,14 +21,14 @@ Supported (plain or .gz-compressed for the text formats):
                              data rows sampled (.xlsm -> .xlsx, macros not copied).
                              Small books (sheet data <= --xlsx-full-max-mb, uncompressed):
                              formatting, comments, hyperlinks, widths, frozen panes
-                             copied. Larger books: fast streaming mode (calamine
-                             reader), values only - formulas become their cached values.
+                             copied. Larger books: streamed row by row, values
+                             only - formulas become their cached values.
 
 Sampling is exact: ceil(N * percent / 100) records, at least --min-rows, at most
 --max-rows, chosen uniformly at random and kept in their original order.
 Each file gets its own RNG derived from --seed + its path, so results are
-reproducible and independent of file order. Large CSV/TSV/NDJSON files are
-streamed twice (count, then write) instead of being loaded into memory.
+reproducible and independent of file order. No file is loaded into memory:
+every format is streamed twice (count, then write the picked records).
 
 Examples:
   uv run sample_files.py exports/*.csv exports/*.xlsx              # 10% -> ./samples/
@@ -65,7 +64,7 @@ def log(msg, style="dim"):
 # ---------- helpers ----------
 def run_cancellable(fn, on_cancel):
     """Run fn() in a worker thread so Ctrl-C is handled at once, even while the
-    worker is inside a long C call (calamine / openpyxl / gzip). The main thread
+    worker is inside a long C call (openpyxl / gzip). The main thread
     only waits; on Ctrl-C it runs on_cancel() and hard-exits with 130. A second
     Ctrl-C during cleanup kills the process outright."""
     box = {}
@@ -241,48 +240,171 @@ def sample_lines(src, dst, gz, sampler, key, ui, unit="records"):
             ui.advance()
     return len(keep), n, unit, ""
 
-def _largest_list(obj, path=(), depth=0):
-    """Path to the largest array inside nested objects (not inside arrays)."""
-    best = (len(obj), path) if isinstance(obj, list) else (-1, None)
-    if isinstance(obj, dict) and depth < 5:
-        for k, v in obj.items():
-            cand = _largest_list(v, path + (k,), depth + 1)
+_JSON_WS = re.compile(r"[ \t\n\r]*")
+
+class JsonStream:
+    """Pull parser for the outer levels of a JSON document read from a text stream.
+    Objects and arrays are entered key by key / element by element; every other
+    value (and every array element) is decoded on its own with raw_decode, so a
+    multi-GB {"value": [...]} export never has to fit in memory."""
+
+    def __init__(self, fh, chunk=1 << 20):
+        self.fh, self.chunk, self.buf, self.pos, self.eof = fh, chunk, "", 0, False
+        self.dec = json.JSONDecoder()
+
+    def _more(self):
+        # read at least as much as is buffered: a record larger than the chunk is
+        # re-decoded O(log size) times instead of once per chunk
+        data = self.fh.read(max(self.chunk, len(self.buf) - self.pos))
+        self.buf, self.pos, self.eof = self.buf[self.pos:] + data, 0, not data
+        return bool(data)
+
+    def peek(self):
+        """Next non-blank character, not consumed ('' at the end of the input)."""
+        while True:
+            self.pos = _JSON_WS.match(self.buf, self.pos).end()
+            if self.pos < len(self.buf):
+                return self.buf[self.pos]
+            if not self._more():
+                return ""
+
+    def take(self, ch):
+        c = self.peek()
+        if c != ch:
+            raise ValueError(f"invalid JSON: expected {ch!r}, found {c or 'end of file'!r}")
+        self.pos += 1
+
+    def value(self):
+        self.peek()
+        while True:
+            try:
+                v, end = self.dec.raw_decode(self.buf, self.pos)
+                # a number may go on in the next chunk ('-0.5' + 'e-7'): need 3 chars after it
+                if len(self.buf) - end >= 3 or self.eof:
+                    self.pos = end
+                    return v
+            except json.JSONDecodeError as e:
+                # a value cut off by the buffer fails at its end (or as an unterminated string)
+                if self.eof or (e.pos < len(self.buf) - 8 and not e.msg.startswith("Unterminated")):
+                    raise
+            self._more()
+
+    def elements(self):
+        """Iterate an array; the caller consumes each element (value() or nested)."""
+        self.take("[")
+        if self.peek() == "]":
+            self.pos += 1
+            return
+        while True:
+            yield
+            if self._close("]"):
+                return
+
+    def keys(self):
+        """Iterate an object's keys; the caller consumes each value."""
+        self.take("{")
+        if self.peek() == "}":
+            self.pos += 1
+            return
+        while True:
+            k = self.value()
+            self.take(":")
+            yield k
+            if self._close("}"):
+                return
+
+    def _close(self, end):
+        c = self.peek()
+        if c not in (",", end):
+            raise ValueError(f"invalid JSON: expected ',' or {end!r}, found {c or 'end of file'!r}")
+        self.pos += 1
+        return c == end
+
+    def finish(self):
+        if self.peek():
+            raise ValueError("invalid JSON: extra data after the document")
+
+def json_dump_at(v, depth):
+    """json.dumps(v, indent=2) as it reads nested `depth` levels deep, so streamed
+    output is laid out exactly like a whole-document dump."""
+    return json.dumps(v, ensure_ascii=False, indent=2).replace("\n", "\n" + "  " * depth)
+
+def _largest_list(js, path=(), depth=0):
+    """(length, path) of the largest array inside nested objects (not inside arrays),
+    reading one element at a time."""
+    c = js.peek()
+    if c == "[":
+        n = 0
+        for _ in js.elements():
+            js.value(); n += 1
+        return n, path
+    best = (-1, None)
+    if c == "{" and depth < 5:
+        for k in js.keys():
+            cand = _largest_list(js, path + (k,), depth + 1)
             if cand[0] > best[0]:
                 best = cand
+    else:
+        js.value()
     return best
 
+COUNT_KEYS = ("count", "total", "@odata.count", "totalCount")
+
+def _write_sampled(js, out, path, keep, ui, depth=0):
+    """Copy the value under the reader to `out` (json.dumps indent=2 layout), one
+    array element at a time. Down `path`, the array at its end keeps only the
+    indices in `keep` and count fields next to it are set to the sample size."""
+    ind = "\n" + "  " * (depth + 1)
+    if js.peek() == "[" and not path:
+        out.write("[")
+        n = 0
+        for i, _ in enumerate(js.elements()):
+            v = js.value()
+            if keep is None or i in keep:
+                out.write(("," if n else "") + ind + json_dump_at(v, depth + 1)); n += 1
+            if keep is not None:
+                ui.advance()
+        out.write("\n" + "  " * depth + "]" if n else "]")
+    elif js.peek() == "{" and path:
+        out.write("{")
+        n = 0
+        for k in js.keys():
+            out.write(("," if n else "") + ind + json.dumps(k, ensure_ascii=False) + ": "); n += 1
+            if k == path[0]:
+                _write_sampled(js, out, path[1:], keep, ui, depth + 1)
+            elif js.peek() == "[":
+                _write_sampled(js, out, (), None, ui, depth + 1)      # other arrays: copied whole
+            else:
+                v = js.value()
+                # keep obvious count fields consistent, e.g. {"count": 1234, "value": [...]}
+                if len(path) == 1 and k in COUNT_KEYS and isinstance(v, int) and not isinstance(v, bool):
+                    v = len(keep)
+                out.write(json_dump_at(v, depth + 1))
+        out.write("\n" + "  " * depth + "}" if n else "}")
+    else:
+        out.write(json_dump_at(js.value(), depth))
+
 def sample_json(src, dst, gz, sampler, key, ui):
-    with open_text(src, gz) as f:
-        raw = f.read()
     try:
-        data = json.loads(raw)
+        with CONSOLE.status(f"counting records in {src.name} ...", spinner="dots"):
+            with open_text(src, gz) as f:
+                js = JsonStream(f)
+                n, path = _largest_list(js)
+                js.finish()
     except ValueError:                                   # JSON lines saved as .json
         return sample_lines(src, dst, gz, sampler, key, ui)
-    n, path = _largest_list(data)
-    if path is None or n <= 0:
-        ui.start(src.name, 1, "document")
-        dst.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        ui.advance()
-        return 1, 1, "document", "no array found - copied whole"
-    parent = data
-    for k in path[:-1]:
-        parent = parent[k]
-    arr = parent[path[-1]] if path else data
-    idx = sampler.pick(n, key)
-    ui.start(src.name, n, "records")
-    picked = [arr[i] for i in idx]
-    ui.advance(n)
-    if path:
-        parent[path[-1]] = picked
-        # keep obvious count fields consistent, e.g. {"count": 1234, "value": [...]}
-        for ck in ("count", "total", "@odata.count", "totalCount"):
-            if isinstance(parent.get(ck), int) and not isinstance(parent.get(ck), bool):
-                parent[ck] = len(picked)
-    else:
-        data = picked
-    dst.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    with open_text(src, gz) as f, open(dst, "w", encoding="utf-8") as out:
+        js = JsonStream(f)
+        if path is None or n <= 0:
+            ui.start(src.name, 1, "document")
+            _write_sampled(js, out, None, None, ui)
+            ui.advance()
+            return 1, 1, "document", "no array found - copied whole"
+        keep = set(sampler.pick(n, key))
+        ui.start(src.name, n, "records")
+        _write_sampled(js, out, path, keep, ui)
     note = f"array at {'.'.join(map(str, path))}" if path else ""
-    return len(picked), n, "records", note
+    return len(keep), n, "records", note
 
 def _nonempty(values):
     return any(v not in (None, "") for v in values)
@@ -301,15 +423,30 @@ def xlsx_sheet_mb(path):
         return 0.0
 
 XL_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+XL_ESCAPE = re.compile(r"_x([0-9A-Fa-f]{4})_")
 
 def xl_safe(v):
-    """openpyxl refuses control characters in cells (Excel stores them as _xHHHH_
-    escapes, which calamine / openpyxl decode on read); replace them with U+FFFD."""
-    return XL_ILLEGAL.sub("\ufffd", v) if isinstance(v, str) else v
+    """Excel stores control characters as _xHHHH_ escapes, which openpyxl leaves
+    as they are: decode them, and replace the ones openpyxl refuses to write with
+    U+FFFD (same values as the full-fidelity copy shows in Excel)."""
+    if not isinstance(v, str):
+        return v
+    if "_x" in v:
+        v = XL_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), v)
+    return XL_ILLEGAL.sub("\ufffd", v)
+
+def xlsx_rows(ws):
+    """Non-empty rows of a read-only (streamed) worksheet as value lists ('' -> None,
+    control characters made safe); rows that only carry formatting are skipped."""
+    ws.reset_dimensions()                          # a wrong <dimension> would cut rows off
+    for row in ws.iter_rows(values_only=True):
+        vals = [None if v == "" else xl_safe(v) for v in row]
+        if _nonempty(vals):
+            yield vals
 
 def sample_xlsx(src, dst, sampler, key, ui, full_max_mb):
     """Full-fidelity copy only for books whose sheet data is small enough to load
-    quickly; everything else goes through the fast calamine path."""
+    quickly; everything else is streamed."""
     data_mb = xlsx_sheet_mb(src)
     if data_mb <= full_max_mb:
         return sample_xlsx_full(src, dst, sampler, key, ui)
@@ -319,45 +456,45 @@ def _xlsx_dst(src, dst):
     return dst.with_suffix(".xlsx") if dst.suffix.lower() == ".xlsm" else dst
 
 def sample_xlsx_fast(src, dst, sampler, key, ui, size_mb):
-    """Large books: calamine reads each sheet in one fast pass (styled-but-empty
-    rows are ignored), openpyxl write-only mode writes the sample."""
-    from openpyxl import Workbook
+    """Large books: openpyxl's read-only parser streams each sheet twice (count the
+    non-empty rows, then pick), write-only mode spools the sample to disk, so
+    memory stays flat however large the sheets are. Values only."""
+    from openpyxl import Workbook, load_workbook
     from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font
-    from python_calamine import CalamineWorkbook
     bold = Font(bold=True)
-    plans, total = [], 0
-    with CONSOLE.status(f"reading {src.name} ({size_mb:,.0f} MB of sheet data) ...", spinner="dots") as st:
-        book = CalamineWorkbook.from_path(str(src))
-        for meta in book.sheets_metadata:
-            if not str(meta.typ).endswith(".WorkSheet"):  # skip chart sheets etc.
-                continue
-            st.update(f"reading {src.name} ({size_mb:,.0f} MB of sheet data) › sheet '{meta.name}' ...")
-            rows = book.get_sheet_by_name(meta.name).to_python(skip_empty_area=False)
-            h = next((i for i, r in enumerate(rows) if _nonempty(r)), None)
-            data = [r for r in rows[h + 1:] if _nonempty(r)] if h is not None else []
-            hidden = not str(meta.visible).endswith(".Visible")   # Hidden / VeryHidden
-            plans.append((meta.name, hidden, rows[h] if h is not None else None, data,
-                          sampler.pick(len(data), f"{key}#{meta.name}")))
-            total += len(data)
-            del rows
-    ui.start(src.name, total, "rows")
-    out, kept = Workbook(write_only=True), 0
-    for name, hidden, header, data, idx in plans:
-        ws = out.create_sheet(name)
-        if hidden:
-            ws.sheet_state = "hidden"
-        if header is not None:
-            cells = []
-            for v in header:
-                c = WriteOnlyCell(ws, value=None if v == "" else xl_safe(v)); c.font = bold; cells.append(c)
-            ws.append(cells)
-        for i in idx:
-            ws.append([None if v == "" else xl_safe(v) for v in data[i]])
-        ui.advance(len(data))
-        kept += len(idx)
-    out.save(_xlsx_dst(src, dst))
-    note = f"{len(plans)} sheet(s), fast mode: values only"
+    book = load_workbook(src, read_only=True, data_only=True)    # formulas -> cached values
+    try:
+        plans, total = [], 0
+        with CONSOLE.status(f"counting rows in {src.name} ({size_mb:,.0f} MB of sheet data) ...",
+                            spinner="dots") as st:
+            for ws in book.worksheets:                 # incl. hidden sheets, not chart sheets
+                st.update(f"counting rows in {src.name} ({size_mb:,.0f} MB of sheet data) › sheet '{ws.title}' ...")
+                n = max(sum(1 for _ in xlsx_rows(ws)) - 1, 0)        # minus header
+                plans.append((ws, set(sampler.pick(n, f"{key}#{ws.title}"))))
+                total += n
+        ui.start(src.name, total, "rows")
+        out, kept = Workbook(write_only=True), 0
+        for ws, keep in plans:
+            nws = out.create_sheet(ws.title)
+            if ws.sheet_state != "visible":            # hidden / veryHidden
+                nws.sheet_state = "hidden"
+            rows = xlsx_rows(ws)
+            header = next(rows, None)
+            if header is not None:
+                cells = []
+                for v in header:
+                    c = WriteOnlyCell(nws, value=v); c.font = bold; cells.append(c)
+                nws.append(cells)
+            for i, row in enumerate(rows):
+                if i in keep:
+                    nws.append(row)
+                ui.advance()
+            kept += len(keep)
+        out.save(_xlsx_dst(src, dst))
+    finally:
+        book.close()
+    note = f"{len(plans)} sheet(s), {size_mb:,.0f} MB streamed: values only"
     if src.suffix.lower() == ".xlsm":
         note += ", -> .xlsx"
     return kept, total, "rows", note

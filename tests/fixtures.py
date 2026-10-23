@@ -190,7 +190,7 @@ def build_sampling_set(folder):
 
 def build_control_chars_xlsx(folder):
     """Cells holding control characters: Excel stores them as _xHHHH_ escapes,
-    which openpyxl / calamine decode to raw chars that openpyxl refuses to write."""
+    which decode to raw chars that openpyxl refuses to write."""
     from openpyxl import Workbook
     d = Path(folder)
     d.mkdir(parents=True, exist_ok=True)
@@ -201,3 +201,33 @@ def build_control_chars_xlsx(folder):
         ws.append(["NT AU_x001E_THORITY\\SYSTEM", f"Priya_x0000_Sharma ran job {i}"])
     wb.save(d / "ctrl.xlsx")
     return d / "ctrl.xlsx"
+
+
+def build_streaming_set(folder):
+    """Files for the streaming code paths: a JSON document with many records, a
+    top-level JSON array, JSON lines saved as .json, and a workbook with CRLF
+    escapes and formatting that runs far below the data."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    d = Path(folder)
+    d.mkdir(parents=True, exist_ok=True)
+    recs = [{"userPrincipalName": "priya.sharma@acmeholdings.com", "tenantName": "Acme Holdings Pvt Ltd",
+             "message": f"Sign-in {i} from 10.20.30.{i % 250} for priya.sharma@acmeholdings.com",
+             "score": i / 7, "ok": i % 2 == 0, "tags": [], "extra": {}} for i in range(1500)]
+    (d / "azure.json").write_text(json.dumps({"@odata.context": "https://graph.example.test/$metadata",
+                                              "count": len(recs), "value": recs, "nextLink": None}))
+    (d / "array.json").write_text(json.dumps(recs[:50], indent=4))
+    (d / "lines.json").write_text("".join(json.dumps(r) + "\n" for r in recs[:20]))
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Alerts"
+    ws.append(["Account", "Notes"])
+    for i in range(30):
+        ws.append(["Priya Sharma", f"Login from 10.1.2.{i}_x000D_\nchecked by SOC"])
+    ws.cell(row=5000, column=1).font = Font(bold=True)         # formatting only, no value
+    h = wb.create_sheet("Raw")
+    h.sheet_state = "hidden"
+    h.append(["src"])
+    h.append(["192.168.7.7"])
+    wb.save(d / "alerts.xlsx")
+    return d

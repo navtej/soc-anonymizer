@@ -75,10 +75,35 @@ def test_line_endings_preserved(tmp_path):
 
 
 def test_xlsx_control_characters(tmp_path):
-    """calamine (fast path) decodes _x001E_ to a raw control char openpyxl can't write."""
+    """The streamed path decodes _x001E_ to a raw control char openpyxl can't write."""
     fixtures.build_control_chars_xlsx(tmp_path / "in")
     run(["in", "-o", "out", "-p", "100", "--xlsx-full-max-mb", "0"], tmp_path)
     from openpyxl import load_workbook
     ws = load_workbook(tmp_path / "out" / "ctrl.xlsx").active
     assert ws.max_row == 11
     assert ws["A2"].value == "NT AU\ufffdTHORITY\\SYSTEM"
+
+
+def test_streamed_xlsx_and_json(tmp_path):
+    """Large-book path and JSON documents are streamed in two passes; counts match
+    the full-fidelity path exactly."""
+    fixtures.build_sampling_set(tmp_path / "in")
+    fixtures.build_streaming_set(tmp_path / "in" / "stream")
+    (tmp_path / "in" / "stream" / "alerts.xlsx").unlink()
+    run(["in", "-o", "out", "--seed", "42", "--xlsx-full-max-mb", "0"], tmp_path)
+    m = json.load(open(tmp_path / "out" / "sample_manifest.json"))
+    got = {Path(f["source"]).name: (f["kept"], f["total"], f["unit"]) for f in m["files"]}
+    assert got["book.xlsx"] == (44, 437, "rows")
+    assert got["lines.json"] == (2, 20, "records")                 # JSON lines saved as .json
+    assert got["array.json"] == (5, 50, "records")
+    out = tmp_path / "out"
+    from openpyxl import load_workbook
+    wb = load_workbook(out / "book.xlsx")
+    assert [(ws.title, ws.sheet_state, ws.max_row) for ws in wb.worksheets] == \
+        [("Tickets", "visible", 41), ("Raw", "hidden", 5)]
+    el = json.loads((out / "elastic.json").read_text())
+    assert el["took"] == 5 and el["hits"]["total"] == {"value": 800} and len(el["hits"]["hits"]) == 80
+    text = (out / "stream" / "azure.json").read_text()
+    az = json.loads(text)
+    assert text == json.dumps(az, ensure_ascii=False, indent=2)
+    assert az["count"] == len(az["value"]) == 150 and az["nextLink"] is None
