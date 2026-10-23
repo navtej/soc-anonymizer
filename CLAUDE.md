@@ -33,8 +33,9 @@ LLM, and that includes you (Claude Code sends everything you read or run to the 
 - Python scripts are **self-contained uv scripts** with PEP 723 inline dependencies
   (`# /// script` header). Keep it that way; no requirements.txt / pyproject for the scripts.
   Run them with `uv run soc_anonymize.py …`.
-- No new heavy dependencies without a reason. Current: `gliner2[local]`, `openpyxl`, `rich`.
-- Tests: `uv run --with pytest --with rich --with openpyxl pytest -q tests`
+- No new heavy dependencies without a reason. Current: `gliner2[local]`, `openpyxl`,
+  `python-calamine`, `rich`.
+- Tests: `uv run --with pytest --with rich --with openpyxl --with python-calamine pytest -q tests`
   (≈10 s; they use `--no-ner` and a stub model, so no model download). Run them after every change
   and add a test for every bug fixed.
 
@@ -102,10 +103,15 @@ but not chased through free text. Sentinel entity objects (`{"Type": "account", 
   `max_len=384`, blob-like text (base64/hex) skips NER. Unbounded input once stalled a run.
 - **Large XLSX**: decided by *uncompressed sheet XML size* (`xlsx_sheet_mb`, default 40 MB):
   small → full-fidelity openpyxl (formatting, comments, links, formulas' string literals, metadata
-  scrubbed, pivot caches dropped); large → openpyxl read-only (row streaming) + write-only,
-  values only, flat memory (only shared strings are held). `_xHHHH_` escapes (e.g. `_x000D_`)
-  are decoded before scrubbing. Trailing rows that only carry formatting are dropped (sheets
-  formatted to row 1,048,576). The prescan streams XLSX the same way.
+  scrubbed, pivot caches dropped); large → `xlsx_stream` (rows of one sheet at a time) +
+  write-only, values only. `xlsx_stream` reads with calamine `iter_rows()` (~10x faster than
+  openpyxl; holds the sheet being read, about its XML size); books over `CALAMINE_MAX_MB`
+  (1000) fall back to openpyxl read-only (flat memory). calamine skips empty leading columns
+  (padded back from `sheet.start`). `_xHHHH_` escapes (e.g. `_x000D_`) are decoded before
+  scrubbing. Trailing rows that only carry formatting are dropped (sheets formatted to row
+  1,048,576). The prescan streams XLSX the same way.
+- **scrub_str memo**: results for values ≤512 chars are cached per (value, column, path),
+  cleared at 50k entries. Repeated cells (status, tenant, alert title) are scrubbed once.
 - **Delimiter detection** by parse consistency (`detect_delimiter`), not `csv.Sniffer`; line
   endings and BOM preserved.
 - Library noise suppressed (`quiet_ml_libs`, `--verbose` to see it); rich progress bars.

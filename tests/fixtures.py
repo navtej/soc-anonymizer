@@ -347,3 +347,30 @@ def build_sentinelone_xlsx(folder):
                "mail from priya.sharma\\u0040acmeholdings.com\\nrahul.verma@acmeholdings.com"])
     wb.save(d / "s1_alerts.xlsx")
     return d
+
+
+def build_offset_xlsx(folder):
+    """Data that starts at C3 next to a chart sheet, with a date, a formula, a gap row
+    and a hidden sheet: the two streaming readers must agree on every row."""
+    import datetime
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, Reference
+    d = Path(folder)
+    d.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Offset"
+    ws["C3"], ws["D3"], ws["E3"] = "Assignee", "Created", "Count"
+    ws["C4"], ws["D4"], ws["E4"] = "Priya Sharma", datetime.datetime(2026, 3, 4, 5, 6), 7
+    ws["C5"], ws["D5"], ws["E5"] = "Login from 10.9.8.7_x000D_ok", "", 2.5
+    ws["C7"] = "after the gap"
+    h = wb.create_sheet("Hidden")
+    h.sheet_state = "hidden"
+    h.append(["src"])
+    h.append(["192.168.7.7"])
+    chart = BarChart()
+    chart.add_data(Reference(ws, min_col=5, min_row=4, max_row=5))
+    wb.create_chartsheet("Chart").add_chart(chart)
+    wb.save(d / "offset.xlsx")
+    return d / "offset.xlsx"
+

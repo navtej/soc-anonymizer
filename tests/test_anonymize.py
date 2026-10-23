@@ -1,6 +1,6 @@
 """Regression tests for soc_anonymize.py - synthetic data only, rules mode (no NER download).
 
-Run:  uv run --with pytest --with rich --with openpyxl pytest -q tests
+Run:  uv run --with pytest --with rich --with openpyxl --with python-calamine pytest -q tests
 """
 import csv
 import importlib.util
@@ -499,6 +499,38 @@ def test_xlsx_streamed_path(tmp_path):
     cells = [str(c.value) for s in wb.worksheets for row in s.iter_rows() for c in row if c.value]
     assert not [c for c in cells if "10.1.2." in c or "Priya" in c or "192.168.7.7" in c], cells[:5]
     assert all("checked by SOC" in str(ws.cell(row=i, column=2).value) for i in range(2, 32))
+
+
+
+def test_xlsx_stream_readers_agree(tmp_path):
+    """calamine (default) and the openpyxl read-only fallback for huge books yield the
+    same sheets and rows: leading empty rows/columns kept, chart sheets skipped."""
+    src = fixtures.build_offset_xlsx(tmp_path)
+    sa = load_module()
+
+    def read():                                       # calamine pads rows to the sheet width
+        return [(t, h, [r[:len(r) - next((i for i, v in enumerate(reversed(r)) if v is not None), len(r))]
+                        for r in rows]) for t, h, rows in sa.xlsx_stream(src)]
+    fast = read()
+    sa.CALAMINE_MAX_MB = -1
+    slow = read()
+    assert fast == slow
+    assert [(t, h) for t, h, _ in fast] == [("Offset", False), ("Hidden", True)]
+    rows = fast[0][2]
+    assert rows[:2] == [[], []] and rows[2][:3] == [None, None, "Assignee"]
+    assert rows[4][2] == "Login from 10.9.8.7\rok" and rows[5] == [] and rows[6][2] == "after the gap"
+    assert sa.xlsx_est_rows(src) == 7 + 2
+
+
+def test_scrub_memo_keeps_column_context(tmp_path):
+    """The scrub_str cache is keyed on the column too: the same value is a user in
+    Assignee but free text in Summary."""
+    sa = load_module()
+    anon = sa.Anonymizer(sa.build_rules([]))
+    as_user = anon.scrub_str("Priya Sharma", "Assignee")
+    assert as_user == sa.pseudo("USER", "Priya Sharma")
+    assert anon.scrub_str("Priya Sharma", "Summary") == "Priya Sharma"   # no lexicon, no NER
+    assert anon.scrub_str("Priya Sharma", "Assignee") == as_user
 
 
 def test_xlsx_crlf_escape_does_not_hide_ips_full_path(tmp_path):

@@ -107,3 +107,27 @@ def test_streamed_xlsx_and_json(tmp_path):
     az = json.loads(text)
     assert text == json.dumps(az, ensure_ascii=False, indent=2)
     assert az["count"] == len(az["value"]) == 150 and az["nextLink"] is None
+
+
+def test_xlsx_stream_readers_agree(tmp_path):
+    """calamine (default) and the openpyxl read-only fallback for huge books yield the
+    same non-empty rows; a 100% streamed sample keeps all of them, hidden sheet hidden."""
+    import importlib.util
+    src = fixtures.build_offset_xlsx(tmp_path / "in")
+    spec = importlib.util.spec_from_file_location("sample_files", SCRIPT)
+    sf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sf)
+
+    def read():                                       # calamine pads rows to the sheet width
+        return [(t, h, [r[:len(r) - next((i for i, v in enumerate(reversed(r)) if v is not None), len(r))]
+                        for r in rows]) for t, h, rows in sf.xlsx_stream(src)]
+    fast = read()
+    sf.CALAMINE_MAX_MB = -1
+    assert fast == read()
+    assert [(t, h, len(r)) for t, h, r in fast] == [("Offset", False, 4), ("Hidden", True, 2)]
+    assert fast[0][2][0] == [None, None, "Assignee", "Created", "Count"]
+    run(["in", "-o", "out", "-p", "100", "--xlsx-full-max-mb", "0"], tmp_path)
+    from openpyxl import load_workbook
+    wb = load_workbook(tmp_path / "out" / "offset.xlsx")
+    assert wb.sheetnames == ["Offset", "Hidden"] and wb["Hidden"].sheet_state == "hidden"
+    assert [c.value for c in wb["Offset"][4]][2] == "after the gap"

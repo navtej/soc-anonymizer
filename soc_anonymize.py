@@ -3,7 +3,8 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "gliner2[local]>=2.1,<3",  # [local] = on-device inference (torch, transformers)
-#     "openpyxl>=3.1",           # .xlsx / .xlsm (large books streamed in read-only mode)
+#     "openpyxl>=3.1",           # .xlsx / .xlsm
+#     "python-calamine>=0.3",    # fast streamed reading of large .xlsx (Rust)
 #     "rich>=13",                # progress display
 # ]
 # ///
@@ -837,12 +838,15 @@ class Reviewer:
             style="yellow" if self.flagged else "green")
 
 # ---------- recursive walker ----------
+MEMO_MAX_LEN, MEMO_SIZE = 512, 50_000   # scrub_str cache: at most ~60 MB
+
 class Anonymizer:
     def __init__(self, rules, ner=None, ner_min_len=25, reviewer=None, lexicon=None):
         self.rules, self.ner, self.ner_min_len = rules, ner, ner_min_len
         self.reviewer, self.lexicon = reviewer, lexicon or Lexicon().compile()
         self.email_rules = [r for r in rules if r[0] in ("EMAIL", "EMAIL_OBF")]
         self.other_rules = [r for r in rules if r[0] not in ("EMAIL", "EMAIL_OBF")]
+        self.memo = {}   # short values repeat a lot (status, tenant, alert title): scrub once
 
     def pseudo_field(self, cat, s):
         if cat == "ISSUEKEY":
@@ -861,6 +865,17 @@ class Anonymizer:
         return apply_rules(self.lexicon.apply(apply_rules(k, self.email_rules)), self.other_rules)
 
     def scrub_str(self, s, key=None, cat=None, path=()):
+        if len(s) > MEMO_MAX_LEN:
+            return self._scrub_str(s, key, cat, path)
+        k = (s, key, cat, path)
+        out = self.memo.get(k)
+        if out is None:
+            if len(self.memo) >= MEMO_SIZE:
+                self.memo.clear()
+            out = self.memo[k] = self._scrub_str(s, key, cat, path)
+        return out
+
+    def _scrub_str(self, s, key=None, cat=None, path=()):
         t = s.strip()
         if t[:1] in "{[" and len(t) > 1:
             try:
@@ -1129,14 +1144,42 @@ def is_ndjson(fh, cap=1 << 24):
     finally:
         fh.seek(0)
 
-def xlsx_rows(ws):
-    """Rows of a read-only (streamed) worksheet as value lists ('' -> None, control
-    characters made safe). Empty rows are only passed on when a non-empty row
-    follows, so sheets formatted down to row 1,048,576 don't end in blank rows."""
-    ws.reset_dimensions()                          # a wrong <dimension> would cut rows off
+CALAMINE_MAX_MB = 1000   # larger books are read by openpyxl read-only: ~10x slower, flat memory
+
+def xlsx_stream(path):
+    """Worksheets (incl. hidden ones, not chart sheets) as (title, hidden, rows) for
+    streaming; rows are value lists ('' -> None, control characters made safe,
+    formulas -> cached values). Empty rows are only passed on when a non-empty row
+    follows, so sheets formatted down to row 1,048,576 don't end in blank rows.
+    calamine (Rust) parses ~10x faster than openpyxl but holds the sheet being read
+    (about its XML size); books above CALAMINE_MAX_MB use openpyxl read-only."""
+    if xlsx_sheet_mb(path) <= CALAMINE_MAX_MB:
+        from python_calamine import CalamineWorkbook
+        book = CalamineWorkbook.from_path(str(path))
+        try:
+            for m in book.sheets_metadata:
+                if str(m.typ).endswith(".WorkSheet"):
+                    sheet = book.get_sheet_by_name(m.name)
+                    pad = [None] * sheet.start[1] if sheet.start else []  # iter_rows drops empty leading columns
+                    rows = (pad + [None if v == "" else XL_ILLEGAL.sub("\ufffd", v) if isinstance(v, str) else v
+                                   for v in row] for row in sheet.iter_rows())  # _xHHHH_ already decoded
+                    yield m.name, not str(m.visible).endswith(".Visible"), _drop_trailing_empty(rows)
+        finally:
+            book.close()
+        return
+    from openpyxl import load_workbook
+    book = load_workbook(path, read_only=True, data_only=True)
+    try:
+        for ws in book.worksheets:
+            ws.reset_dimensions()                  # a wrong <dimension> would cut rows off
+            rows = ([None if v == "" else xl_safe(v) for v in row] for row in ws.iter_rows(values_only=True))
+            yield ws.title, ws.sheet_state != "visible", _drop_trailing_empty(rows)
+    finally:
+        book.close()
+
+def _drop_trailing_empty(rows):
     gap = 0
-    for row in ws.iter_rows(values_only=True):
-        vals = [None if v == "" else xl_safe(v) for v in row]
+    for vals in rows:
         if not _nonempty(vals):
             gap += 1
             continue
@@ -1144,9 +1187,21 @@ def xlsx_rows(ws):
         gap = 0
         yield vals
 
-def open_xlsx_stream(path):
-    from openpyxl import load_workbook
-    return load_workbook(path, read_only=True, data_only=True)  # formulas -> cached values
+def xlsx_est_rows(path):
+    """Rows per the sheets' <dimension> tags (near the start of each sheet XML):
+    a quick estimate for the progress bar."""
+    import zipfile
+    n = 0
+    try:
+        with zipfile.ZipFile(path) as z:
+            for i in z.infolist():
+                if i.filename.startswith("xl/worksheets/") and i.filename.endswith(".xml"):
+                    with z.open(i) as fh:
+                        m = re.search(rb'<dimension ref="(?:[A-Z]+\d+:)?[A-Z]+(\d+)"', fh.read(4096))
+                    n += int(m.group(1)) if m else 0
+    except zipfile.BadZipFile:
+        pass
+    return n
 
 # ---------- pre-scan: learn identifiers from identity columns of all inputs ----------
 def prescan(jobs, lexicon, cancel_ok=True):
@@ -1209,15 +1264,11 @@ def prescan(jobs, lexicon, cancel_ok=True):
                     header = next(rd, [])
                     take(label, header, rd)
             elif suf in (".xlsx", ".xlsm"):
-                book = open_xlsx_stream(f)
-                try:
-                    for ws in book.worksheets:
-                        rows = (r for r in xlsx_rows(ws) if r)
-                        header = next(rows, None)
-                        if header is not None:
-                            take(f"{label} › {ws.title}", ["" if x is None else str(x) for x in header], rows)
-                finally:
-                    book.close()
+                for title, _hidden, rows in xlsx_stream(f):
+                    rows = (r for r in rows if r)
+                    header = next(rows, None)
+                    if header is not None:
+                        take(f"{label} › {title}", ["" if x is None else str(x) for x in header], rows)
             elif suf in (".ndjson", ".jsonl", ".json"):
                 with f.open("r", encoding="utf-8-sig", errors="replace", newline="") as fh:
                     if suf != ".json" or is_ndjson(fh):
@@ -1303,48 +1354,43 @@ def process_xlsx(path, out, anon, ui, full_max_mb):
     return process_xlsx_fast(path, out, anon, ui, data_mb)
 
 def process_xlsx_fast(path, out, anon, ui, size_mb):
-    """openpyxl read-only mode parses one row at a time and write-only mode spools
-    rows to disk, so memory stays flat however large the sheets are (only the
-    shared-strings table is held)."""
+    """Rows are read one sheet at a time (xlsx_stream) and write-only mode spools
+    them to disk, so memory stays bounded however large the book is."""
     from openpyxl import Workbook
     from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font
-    bold, cells = Font(bold=True), 0
-    book = open_xlsx_stream(path)
-    try:
-        sheets = book.worksheets                   # includes hidden sheets, not chart sheets
-        ui.start(path.name, sum(ws.max_row or 0 for ws in sheets), "rows")  # from <dimension>: an estimate
-        wb = Workbook(write_only=True)
-        wb.properties.creator = wb.properties.lastModifiedBy = "anonymized"
-        for src in sheets:
-            ws = wb.create_sheet(apply_rules(src.title, anon.rules)[:31])
-            if src.sheet_state != "visible":
-                ws.sheet_state = "hidden"
-            header = None
-            for vals in xlsx_rows(src):
-                ui.advance()
-                if header is None:
-                    if vals:
-                        header = [str(v) if v is not None else None for v in vals]
-                        hc = []
-                        for v in vals:
-                            c = WriteOnlyCell(ws, value=apply_rules(v, anon.rules) if isinstance(v, str) else v)
-                            c.font = bold; hc.append(c)
-                        ws.append(hc)
-                    else:
-                        ws.append([])
-                    continue
-                outrow = []
-                for i, v in enumerate(vals):
-                    if isinstance(v, str) and v:
-                        v = anon.scrub_str(v, header[i] if i < len(header) else None)
-                        cells += 1
-                    outrow.append(v)
-                ws.append(outrow)
-        wb.save(xlsx_out(out))
-    finally:
-        book.close()
-    note = f"{len(sheets)} sheet(s), {cells:,} cells, {size_mb:,.0f} MB streamed: values only"
+    bold, cells, n_sheets = Font(bold=True), 0, 0
+    ui.start(path.name, xlsx_est_rows(path), "rows")
+    wb = Workbook(write_only=True)
+    wb.properties.creator = wb.properties.lastModifiedBy = "anonymized"
+    for title, hidden, rows in xlsx_stream(path):
+        n_sheets += 1
+        ws = wb.create_sheet(apply_rules(title, anon.rules)[:31])
+        if hidden:
+            ws.sheet_state = "hidden"
+        header = None
+        for vals in rows:
+            ui.advance()
+            if header is None:
+                if vals:
+                    header = [str(v) if v is not None else None for v in vals]
+                    hc = []
+                    for v in vals:
+                        c = WriteOnlyCell(ws, value=apply_rules(v, anon.rules) if isinstance(v, str) else v)
+                        c.font = bold; hc.append(c)
+                    ws.append(hc)
+                else:
+                    ws.append([])
+                continue
+            outrow = []
+            for i, v in enumerate(vals):
+                if isinstance(v, str) and v:
+                    v = anon.scrub_str(v, header[i] if i < len(header) else None)
+                    cells += 1
+                outrow.append(v)
+            ws.append(outrow)
+    wb.save(xlsx_out(out))
+    note = f"{n_sheets} sheet(s), {cells:,} cells, {size_mb:,.0f} MB streamed: values only"
     return note + (", -> .xlsx" if path.suffix.lower() == ".xlsm" else "")
 
 def xlsx_out(out):

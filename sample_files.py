@@ -2,7 +2,8 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "openpyxl>=3.1",          # .xlsx / .xlsm (large books streamed in read-only mode)
+#     "openpyxl>=3.1",          # .xlsx / .xlsm
+#     "python-calamine>=0.3",   # fast streamed reading of large .xlsx (Rust)
 #     "rich>=13",               # progress display
 # ]
 # ///
@@ -435,14 +436,38 @@ def xl_safe(v):
         v = XL_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), v)
     return XL_ILLEGAL.sub("\ufffd", v)
 
-def xlsx_rows(ws):
-    """Non-empty rows of a read-only (streamed) worksheet as value lists ('' -> None,
-    control characters made safe); rows that only carry formatting are skipped."""
-    ws.reset_dimensions()                          # a wrong <dimension> would cut rows off
-    for row in ws.iter_rows(values_only=True):
-        vals = [None if v == "" else xl_safe(v) for v in row]
-        if _nonempty(vals):
-            yield vals
+CALAMINE_MAX_MB = 1000   # larger books are read by openpyxl read-only: ~10x slower, flat memory
+
+def xlsx_stream(path):
+    """Worksheets (incl. hidden ones, not chart sheets) as (title, hidden, rows) for
+    streaming; rows are the non-empty rows as value lists ('' -> None, control
+    characters made safe, formulas -> cached values), so rows that only carry
+    formatting are skipped. calamine (Rust) parses ~10x faster than openpyxl but
+    holds the sheet being read (about its XML size); books above CALAMINE_MAX_MB
+    use openpyxl read-only."""
+    if xlsx_sheet_mb(path) <= CALAMINE_MAX_MB:
+        from python_calamine import CalamineWorkbook
+        book = CalamineWorkbook.from_path(str(path))
+        try:
+            for m in book.sheets_metadata:
+                if str(m.typ).endswith(".WorkSheet"):
+                    sheet = book.get_sheet_by_name(m.name)
+                    pad = [None] * sheet.start[1] if sheet.start else []  # iter_rows drops empty leading columns
+                    rows = (pad + [None if v == "" else XL_ILLEGAL.sub("\ufffd", v) if isinstance(v, str) else v
+                                   for v in row] for row in sheet.iter_rows())  # _xHHHH_ already decoded
+                    yield m.name, not str(m.visible).endswith(".Visible"), filter(_nonempty, rows)
+        finally:
+            book.close()
+        return
+    from openpyxl import load_workbook
+    book = load_workbook(path, read_only=True, data_only=True)
+    try:
+        for ws in book.worksheets:
+            ws.reset_dimensions()                  # a wrong <dimension> would cut rows off
+            rows = ([None if v == "" else xl_safe(v) for v in row] for row in ws.iter_rows(values_only=True))
+            yield ws.title, ws.sheet_state != "visible", filter(_nonempty, rows)
+    finally:
+        book.close()
 
 def sample_xlsx(src, dst, sampler, key, ui, full_max_mb):
     """Full-fidelity copy only for books whose sheet data is small enough to load
@@ -456,44 +481,39 @@ def _xlsx_dst(src, dst):
     return dst.with_suffix(".xlsx") if dst.suffix.lower() == ".xlsm" else dst
 
 def sample_xlsx_fast(src, dst, sampler, key, ui, size_mb):
-    """Large books: openpyxl's read-only parser streams each sheet twice (count the
-    non-empty rows, then pick), write-only mode spools the sample to disk, so
-    memory stays flat however large the sheets are. Values only."""
-    from openpyxl import Workbook, load_workbook
+    """Large books: xlsx_stream reads each sheet twice (count the non-empty rows,
+    then pick), write-only mode spools the sample to disk, so memory stays bounded
+    however large the book is. Values only."""
+    from openpyxl import Workbook
     from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font
     bold = Font(bold=True)
-    book = load_workbook(src, read_only=True, data_only=True)    # formulas -> cached values
-    try:
-        plans, total = [], 0
-        with CONSOLE.status(f"counting rows in {src.name} ({size_mb:,.0f} MB of sheet data) ...",
-                            spinner="dots") as st:
-            for ws in book.worksheets:                 # incl. hidden sheets, not chart sheets
-                st.update(f"counting rows in {src.name} ({size_mb:,.0f} MB of sheet data) › sheet '{ws.title}' ...")
-                n = max(sum(1 for _ in xlsx_rows(ws)) - 1, 0)        # minus header
-                plans.append((ws, set(sampler.pick(n, f"{key}#{ws.title}"))))
-                total += n
-        ui.start(src.name, total, "rows")
-        out, kept = Workbook(write_only=True), 0
-        for ws, keep in plans:
-            nws = out.create_sheet(ws.title)
-            if ws.sheet_state != "visible":            # hidden / veryHidden
-                nws.sheet_state = "hidden"
-            rows = xlsx_rows(ws)
-            header = next(rows, None)
-            if header is not None:
-                cells = []
-                for v in header:
-                    c = WriteOnlyCell(nws, value=v); c.font = bold; cells.append(c)
-                nws.append(cells)
-            for i, row in enumerate(rows):
-                if i in keep:
-                    nws.append(row)
-                ui.advance()
-            kept += len(keep)
-        out.save(_xlsx_dst(src, dst))
-    finally:
-        book.close()
+    plans, total = [], 0
+    with CONSOLE.status(f"counting rows in {src.name} ({size_mb:,.0f} MB of sheet data) ...",
+                        spinner="dots") as st:
+        for title, _hidden, rows in xlsx_stream(src):
+            st.update(f"counting rows in {src.name} ({size_mb:,.0f} MB of sheet data) › sheet '{title}' ...")
+            n = max(sum(1 for _ in rows) - 1, 0)        # minus header
+            plans.append(set(sampler.pick(n, f"{key}#{title}")))
+            total += n
+    ui.start(src.name, total, "rows")
+    out, kept = Workbook(write_only=True), 0
+    for keep, (title, hidden, rows) in zip(plans, xlsx_stream(src)):
+        nws = out.create_sheet(title)
+        if hidden:                                     # hidden / veryHidden
+            nws.sheet_state = "hidden"
+        header = next(rows, None)
+        if header is not None:
+            cells = []
+            for v in header:
+                c = WriteOnlyCell(nws, value=v); c.font = bold; cells.append(c)
+            nws.append(cells)
+        for i, row in enumerate(rows):
+            if i in keep:
+                nws.append(row)
+            ui.advance()
+        kept += len(keep)
+    out.save(_xlsx_dst(src, dst))
     note = f"{len(plans)} sheet(s), {size_mb:,.0f} MB streamed: values only"
     if src.suffix.lower() == ".xlsm":
         note += ", -> .xlsx"
