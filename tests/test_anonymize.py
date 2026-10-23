@@ -301,3 +301,93 @@ def test_xlsx_control_characters(tmp_path):
     ws = load_workbook(tmp_path / "out" / "ctrl.xlsx").active
     assert ws.max_row == 11
     assert "\ufffd" in ws["B2"].value
+
+
+# --------------------------------------------------------------------------- Wazuh / AWS
+
+def test_wazuh_fields_hosts_with_ips_and_aws(tmp_path):
+    fixtures.build_wazuh(tmp_path / "wz")
+    run(["wz", "-o", "out", "--no-ner", "--map", "out/map.json"], tmp_path)
+    m = json.load(open(tmp_path / "out" / "map.json"))
+    assert_mapping_sane(m)
+    text = all_text(tmp_path / "out")
+    left = [s for s in fixtures.WZ_SECRETS if s.lower() in text.lower()]
+    assert not left, f"leaked: {left}"
+
+    H, row = (r := read_csv(tmp_path / "out" / "wazuh.csv"))[0], r[1]
+    col = lambda name: row[H.index(name)]
+    # host names that embed an IP: one HOST token, in its column and in full_log
+    host = col("_source.agent.name")
+    assert host.startswith("HOST_") and col("_source.predecoder.hostname") == host
+    assert host in col("_source.full_log")
+    assert col("_source.manager.name").startswith("HOST_")
+    # same IP -> same token in srcip, full_log and the dashed host name's own IP stays hidden
+    assert col("_source.data.srcip") in col("_source.full_log")
+    assert col("_source.data.aws.sourceIPAddress").startswith("HOST_")
+    # public AWS service endpoints / principals kept, IP-bearing public DNS replaced
+    assert col("_source.data.aws.eventSource") == "ec2.amazonaws.com"
+    assert col("_source.data.aws.userIdentity.invokedBy") == "AWS Internal"
+    assert col("_source.data.aws.resource.instanceDetails.networkInterfaces.publicDnsName").startswith("HOST_")
+    # account id: one token in its column, the ARN and the S3 log path; ARN structure kept
+    acct = col("_source.data.aws.userIdentity.accountId")
+    assert acct.startswith("AWSACCOUNT_")
+    assert col("_source.data.aws.userIdentity.arn").startswith(f"arn:aws:iam::{acct}:user/USER_")
+    assert col("_source.data.aws.log_info.log_file").count(acct) == 2
+    assert col("_source.data.srcuser") in col("_source.data.aws.userIdentity.arn")
+    assert col("_source.data.aws.userIdentity.accessKeyId").startswith("AWSKEY_")
+    assert col("_source.data.aws.responseElements.securityGroupRuleSet.items.securityGroupRuleId").startswith("AWSRES_")
+    assert col("_source.data.aws.resource.instanceDetails.networkInterfaces.ipv6Addresses").startswith("2001:db8::")
+    tags = json.loads(col("_source.data.aws.resource.instanceDetails.tags"))
+    assert tags[0]["key"] == "Name" and tags[0]["value"].startswith("AWSTAG_")
+    for g in ("city_name", "region_name", "country_name"):
+        assert col(f"_source.GeoLocation.{g}").startswith("GEO_")
+    # non-identity fields unchanged
+    assert col("_source.rule.mail") == "false" and col("_source.rule.level") == "5"
+    assert col("_source.rule.description") == "sshd: authentication success."
+    assert col("_source.location") == "/var/log/secure"
+
+    # nested JSON export: same tokens as the CSV, raw CloudTrail inside full_log scrubbed too
+    hit = json.loads((tmp_path / "out" / "wazuh.ndjson").read_text())
+    src = hit["_source"]
+    assert src["manager"]["name"].startswith("HOST_") and src["rule"]["mail"] is False
+    assert src["GeoLocation"]["city_name"] == col("_source.GeoLocation.city_name")
+    aws = src["data"]["aws"]
+    assert aws["userIdentity"]["accountId"] == acct == aws["recipientAccountId"]
+    assert aws["log_info"]["s3bucket"] == col("_source.data.aws.log_info.s3bucket")
+    assert aws["resource"]["instanceDetails"]["networkInterfaces"][0]["privateDnsName"] == host
+    ct = json.loads(src["full_log"])
+    assert ct["userIdentity"]["arn"] == aws["userIdentity"]["arn"]
+    # role name is also sessionIssuer.userName -> its USER token, also inside the ARN
+    role = ct["userIdentity"]["sessionContext"]["sessionIssuer"]["userName"]
+    assert ct["userIdentity"]["arn"].startswith(f"arn:aws:sts::{acct}:assumed-role/{role}/USER_")
+    assert ct["userIdentity"]["sessionContext"]["sessionIssuer"]["arn"] == f"arn:aws:iam::{acct}:role/{role}"
+    assert ct["eventSource"] == "ec2.amazonaws.com" and ct["eventName"] == "AuthorizeSecurityGroupIngress"
+
+
+@pytest.mark.parametrize("header,cat", [
+    ("_source.agent.name", "HOST"), ("_source.manager.name", "HOST"), ("_source.predecoder.hostname", "HOST"),
+    ("_source.data.srcuser", "USER"), ("_source.data.dstuser", "USER"), ("_source.rule.mail", None),
+    ("_source.rule.description", None), ("_source.agent.id", None), ("_source.full_log", None),
+    ("_source.data.win.eventdata.targetUserName", "USER"), ("_source.data.win.system.computer", "HOST"),
+    ("_source.data.aws.userIdentity.accountId", "AWSACCOUNT"), ("_source.GeoLocation.city_name", "GEO"),
+    ("_source.data.aws.userIdentity.sessionContext.sessionIssuer.principalId", "USERID"),
+    ("_source.data.aws.resource.instanceDetails.networkInterfaces.0.privateIpAddress", "HOST"),
+    ("_source.data.aws.eventSource", "HOST"), ("OwnerId", "USERID"), ("Custom field (Description.)", None)])
+def test_dotted_field_classification(header, cat):
+    assert load_module().column_category(header) == cat
+
+
+@pytest.mark.parametrize("text,gone", [
+    ("conn from ip-10-1-2-3 ok", "10-1-2-3"), ("dns ip-10-1-2-3.eu-west-1.compute.internal.", "10-1-2-3"),
+    ("v6 2600:1f18:aa:bb::51 seen", "2600:1f18"), ("key AKIAZZEXAMPLE7QK3WPL used", "AKIAZZ"),
+    ("arn:aws:s3:::acme-bucket/priv/x.txt", "acme-bucket")])
+def test_aws_and_dashed_ip_rules(text, gone):
+    sa = load_module()
+    assert gone not in sa.Anonymizer(sa.build_rules([])).scrub_str(text)
+
+
+@pytest.mark.parametrize("text", ["at 10:30:45 build 1.2.3", "arn:aws:iam::aws:policy/AdministratorAccess",
+                                  "std::vector size 12:34", "event 4624 port 443"])
+def test_aws_rules_leave_lookalikes(text):
+    sa = load_module()
+    assert sa.Anonymizer(sa.build_rules([])).scrub_str(text) == text

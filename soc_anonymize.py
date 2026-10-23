@@ -199,7 +199,47 @@ COLUMN_RULES = [
 ]
 # Column-only categories: replaced in their own column, but NOT chased through free text
 # (e.g. 'Microsoft' as VendorName should not wipe every 'Microsoft' from descriptions).
-COLUMN_ONLY = {"PROVIDER", "VENDOR", "SYSTEM", "VENDORID", "ISSUEID"}
+COLUMN_ONLY = {"PROVIDER", "VENDOR", "SYSTEM", "VENDORID", "ISSUEID", "GEO", "AWSTAG", "SERIAL"}
+
+# Dotted field paths (Wazuh / Elastic exports: '_source.agent.name' as a CSV header, or the
+# same nesting in JSON). Keys are lowercase path suffixes; the longest matching suffix wins
+# and beats the leaf-name COLUMN_RULES. None = keep (not an identity field).
+# Fields not listed here fall back to COLUMN_RULES on their last segment
+# ('data.win.eventdata.targetUserName' -> 'target user name' -> USER).
+FIELD_PATHS = {
+    # Wazuh core
+    "agent.name": "HOST", "manager.name": "HOST", "cluster.node": "HOST", "cluster.name": "HOST",
+    "predecoder.hostname": "HOST", "host.name": "HOST", "observer.name": "HOST",
+    "rule.mail": None, "organization.org": None, "organization.isp": None, "organization.asnorg": None,
+    "data.srcuser": "USER", "data.dstuser": "USER", "audit.acct": "USER", "login_user.name": "USER",
+    "effective_user.name": "USER", "user.name": "USER", "uname_before": "USER", "uname_after": "USER",
+    "data.srcip": "HOST", "data.dstip": "HOST", "data.src_ip": "HOST", "data.dst_ip": "HOST",
+    "hardware.serial": "SERIAL",
+    # Windows eventdata
+    "subjectdomainname": "DOMAIN", "targetdomainname": "DOMAIN", "samaccountname": "USER",
+    "destinationhostname": "HOST", "sourcehostname": "HOST",
+    # geo (Wazuh GeoLocation, GuardDuty remoteIpDetails)
+    **{f"geolocation.{k}": "GEO" for k in ("city_name", "region_name", "real_region_name", "country_name",
+                                            "country_code2", "country_code3", "postal_code", "area_code",
+                                            "dma_code", "latitude", "longitude", "lat", "lon",
+                                            "coordinates", "location", "timezone")},
+    "city.cityname": "GEO", "country.countryname": "GEO", "country.countrycode": "GEO",
+    "actor_location.country_code": "GEO",
+    # AWS (CloudTrail / GuardDuty / VPC flow via Wazuh, also raw CloudTrail JSON in full_log)
+    "aws.eventsource": "HOST", "sourceipaddress": "HOST", "aws.source_ip_address": "HOST",
+    "aws.srcaddr": "HOST", "aws.dstaddr": "HOST", "useridentity.invokedby": "HOST",
+    "privatednsname": "HOST", "publicdnsname": "HOST", "privateipaddress": "HOST", "publicip": "HOST",
+    "ipv6addresses": "HOST", "ipaddressv4": "HOST", "clientprovidedhostheader": "HOST",
+    "aws.accountid": "AWSACCOUNT", "aws.account_id": "AWSACCOUNT", "aws.aws_account_id": "AWSACCOUNT",
+    "useridentity.accountid": "AWSACCOUNT", "recipientaccountid": "AWSACCOUNT", "responseelements.ownerid": "AWSACCOUNT",
+    "log_info.s3bucket": "BUCKET", "bucketname": "BUCKET",
+    "rolesessionname": "USER", "masterusername": "USER", "masteruserpassword": "SECRET",
+    "instancedetails.tags": "AWSTAG", "instancedetails.tags.value": "AWSTAG",
+    # Office 365 / Graph / GCP
+    "office365.userkey": "USERID", "mailboxownerupn": "EMAIL", "ms-graph.assignedto": "USER",
+    "ms-graph.actordisplayname": "USER", "principalemail": "EMAIL", "vminstancename": "HOST",
+    "labels.project_id": "TENANT",
+}
 
 # Sentinel / Defender entity objects ({"Type": "account", "Name": ..., "UPNSuffix": ...}):
 # their field names are too generic for column rules ('Name'), so map them per entity type.
@@ -222,8 +262,8 @@ ENTITY_FIELDS = {
     "cloud-logon-session": {"userprincipalname": "EMAIL"},
 }
 
-def json_field_category(parent, key):
-    """Category for parent[key]: entity-type aware for Sentinel entities, else by key name."""
+def json_field_category(parent, key, path=()):
+    """Category for parent[key]: entity-type aware for Sentinel entities, else by key name/path."""
     if not isinstance(key, str):
         return None
     t = parent.get("Type") or parent.get("type") if isinstance(parent, dict) else None
@@ -231,14 +271,30 @@ def json_field_category(parent, key):
         m = ENTITY_FIELDS.get(t.lower())
         if m is not None and key.lower() in m:
             return m[key.lower()]
-    return column_category(key)
+    return column_category(key, path)
+
+# Public AWS service endpoints / principals ('ec2.amazonaws.com', 'AWS Internal') in host-like
+# fields are not identifying: they go through the free-text rules instead of becoming HOST_x.
+AWS_PUBLIC_RX = re.compile(r"(?i)(?:[a-z0-9-]+\.)*amazonaws\.com|aws internal")
+DASHED_IP = r"(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)-){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)"
 
 def resolve_category(cat, value):
-    """ENTITY columns hold either a UPN or a host name; USER columns sometimes hold UPNs."""
+    """ENTITY columns hold either a UPN or a host name; USER columns sometimes hold UPNs;
+    host columns sometimes hold IPs (-> the same IP token as in free text)."""
+    v = value.strip()
     if cat == "ENTITY":
-        return "EMAIL" if "@" in value else "HOST"
-    if cat in ("USER", "EMAIL") and "@" in value:
+        cat = "EMAIL" if "@" in v else "HOST"
+    if cat in ("USER", "EMAIL", "USERID") and "@" in v:
         return "EMAIL"
+    if cat == "USERID" and re.fullmatch(r"\d{12}", v):          # AWS accountId in raw CloudTrail JSON
+        return "AWSACCOUNT"
+    if cat == "HOST":
+        try:
+            return "IPV4" if ipaddress.ip_address(v).version == 4 else "IPV6"
+        except ValueError:
+            pass
+        if AWS_PUBLIC_RX.fullmatch(v) and not re.search(DASHED_IP, v):
+            return None
     return cat
 
 def registrable_label(domain):
@@ -254,23 +310,42 @@ _COLUMN_RX = [(cat, re.compile(rf"(?:{rx})")) for cat, rx in COLUMN_RULES]
 COLUMN_OVERRIDES = {}      # norm header -> category or None (keep); filled from --id-columns/--keep-columns
 _COL_CACHE = {}
 
-def column_category(header):
+def _rule_category(n):
+    return next((c for c, rx in _COLUMN_RX if rx.fullmatch(n)), None)
+
+def column_category(header, path=()):
+    """header: a column name or JSON key; path: the enclosing JSON keys (or the cell's column).
+    Dotted names ('_source.agent.name') are split into path segments."""
     if not header:
         return None
-    if header in _COL_CACHE:
-        return _COL_CACHE[header]
+    ck = (header, path)
+    if ck in _COL_CACHE:
+        return _COL_CACHE[ck]
     n = norm_header(header)
     if n in COLUMN_OVERRIDES:
         cat = COLUMN_OVERRIDES[n]
     else:
-        cat = next((c for c, rx in _COLUMN_RX if rx.fullmatch(n)), None)
-    _COL_CACHE[header] = cat
+        segs = [s for p in (*path, header) for s in str(p).split(".")] if " " not in header.strip() \
+            else [s for p in path for s in str(p).split(".")] + [header]
+        segs = [re.sub(r"\[\d+\]$", "", s).lower() for s in segs]
+        segs = [s for s in segs if s and not s.isdigit()]     # 'networkInterfaces.0.publicIp'
+        cat = _rule_category(n)
+        for i in range(len(segs)):
+            suffix = ".".join(segs[i:])
+            if suffix in FIELD_PATHS:
+                cat = FIELD_PATHS[suffix]
+                break
+        else:
+            if cat is None and len(segs) > 1 and "." in header:
+                cat = _rule_category(norm_header(header.rsplit(".", 1)[1]))
+    _COL_CACHE[ck] = cat
     return cat
 
 # ---------- lexicon: known identifiers, replaced wherever they appear in free text ----------
 STOP_TERMS = {"unassigned", "none", "null", "n/a", "na", "nil", "-", "--", "unknown", "system", "admin",
               "administrator", "automation for jira", "jira", "service desk", "internal", "test", "default",
-              "true", "false", "yes", "no", "high", "low", "medium", "critical", "open", "closed"}
+              "true", "false", "yes", "no", "high", "low", "medium", "critical", "open", "closed",
+              "root", "nobody", "ec2-user", "ubuntu"}
 CORP_SUFFIX = re.compile(r"[\s,.]+(private|pvt\.?|ltd\.?|limited|inc\.?|incorporated|corp\.?|corporation|"
                          r"llc|l\.l\.c\.|llp|plc|gmbh|ag|sa|bv|co\.?|company|group|holdings?|"
                          r"technologies|technology|tech|solutions|services|systems|india|global)\.?$", re.I)
@@ -294,7 +369,7 @@ class Lexicon:
         matched when written like a name (Capitalised or ALL CAPS), so a tenant called
         'Global Bank' doesn't wipe out every 'global' in the text."""
         t = term.strip()
-        if len(t) < 3 or t.lower() in STOP_TERMS or t.isdigit():
+        if len(t) < 3 or t.lower() in STOP_TERMS or (t.isdigit() and cat != "AWSACCOUNT"):
             return
         if weak and " " in t:
             weak = False
@@ -312,11 +387,11 @@ class Lexicon:
                 self.key_prefixes.add(m.group(1).upper())
             self.counts[cat] = self.counts.get(cat, 0) + 1
             return
-        if cat in COLUMN_ONLY or v.isdigit():
-            return                          # bare numbers in prose are too ambiguous to chase
         cat = resolve_category(cat, v)
+        if cat in COLUMN_ONLY or (v.isdigit() and cat != "AWSACCOUNT"):
+            return                          # bare numbers in prose are too ambiguous to chase
         if cat in ("USER", "TENANT", "USERID", "TENANTID", "EMAIL", "HOST", "HOSTID", "SUBSCRIPTIONID",
-                   "RG", "WORKSPACE", "DOMAIN", "SID", "TERM"):
+                   "RG", "WORKSPACE", "DOMAIN", "SID", "TERM", "AWSACCOUNT", "BUCKET"):
             before = len(self.terms)
             if cat == "DOMAIN":
                 self.add_domain(v)
@@ -409,6 +484,36 @@ class Lexicon:
         return f"lexicon: {len(self.terms):,} terms ({'; '.join(parts) or 'none'})"
 
 # ---------- regex rules (order matters: specific before generic) ----------
+AWS_RES_ID = (r"\b(?:i|sg|sgr|vpc|subnet|eni|vol|snap|ami|igw|nat|rtb|acl|eipalloc|eipassoc|lt|vpce|pcx|tgw|"
+              r"tgw-attach)-[0-9a-f]{8,17}\b")
+AWS_KEEP_SEGS = {"", "*", "aws-service-role", "service-role", "aws-reserved"}
+
+def _arn_sub(m):
+    """arn:aws:iam::123456789012:assumed-role/AcmeAdmin/priya -> account and names tokenized,
+    service / region / resource type kept. AWS-managed ARNs (account 'aws') stay as they are."""
+    prefix, service, acct, res = m.group(1), m.group(2), m.group(3), m.group(4)
+    if acct == "aws":
+        return m.group(0)
+    if acct and not TOKEN_RX.fullmatch(acct):
+        acct = pseudo("AWSACCOUNT", acct)
+    parts = re.split(r"([/:])", res)
+    typ = None if service == "s3" else parts[0]
+    names = [i for i in range(0 if typ is None else 2, len(parts), 2)]
+    for i in names:
+        seg = parts[i]
+        if seg in AWS_KEEP_SEGS or seg in MAPPING or TOKEN_RX.fullmatch(seg):
+            continue
+        if service == "s3" and i == 0:
+            cat = "BUCKET"
+        elif re.fullmatch(AWS_RES_ID, seg):
+            cat = "AWSRES"
+        elif typ == "user" or (typ == "assumed-role" and i == names[-1] and len(names) > 1):
+            cat = resolve_category("USER", seg)               # same token as userName / e-mail columns
+        else:
+            cat = "AWSRES"
+        parts[i] = pseudo(cat, seg)
+    return f"{prefix}{acct or ''}:{''.join(parts)}"
+
 def build_rules(domains):
     rules = [
         ("SECRET", re.compile(r"\beyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}\b")),             # JWT
@@ -423,13 +528,25 @@ def build_rules(domains):
         ("RG", re.compile(r"(?i)(?:/resourceGroups?/|resourceGroup[/=])([^/\s\"'?#&\\]+)")),
         ("WORKSPACE", re.compile(r"(?i)/workspaces/([^/\s\"'?#&\\]+)")),
         ("HOST", re.compile(r"(?i)/(?:virtualMachines|machines|computers)/([^/\s\"'?#&\\]+)")),
+        # AWS: ARNs (account + resource names, structure kept), account ids in S3 log paths,
+        # access key ids, resource ids (i-, sg-, sgr-, vpc- ...)
+        ("ARN", re.compile(r"\b(arn:aws[\w-]*:([\w-]*):[\w-]*:)(\d{12}|aws|AWSACCOUNT_[0-9a-f]{8})?:"
+                           r"([^\s\"',;<>\[\]{}()]+)")),
+        ("AWSACCOUNT", re.compile(r"(?i)AWSLogs/(?:o-[a-z0-9]+/)?(\d{12})(?=/)")),
+        ("AWSACCOUNT", re.compile(r"(?<![\w-])(\d{12})(?=_(?:CloudTrail|vpcflowlogs|elasticloadbalancing|"
+                                  r"GuardDuty|Config|CloudTrail-Digest)[_-])")),
+        ("AWSKEY", re.compile(r"\b(?:AKIA|ASIA|AIDA|AROA|AGPA|ANPA|ANVA|AIPA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b")),
+        ("AWSRES", re.compile(AWS_RES_ID)),
         ("DOMAIN", re.compile(r"(?i)\b([\w-]+)\.onmicrosoft\.com\b")),
         ("DOMAIN", re.compile(r"(?i)\bDC=([\w-]+)")),
         ("SID", re.compile(r"\bS-1-5-21-\d+-\d+-\d+-\d+\b")),
         ("GUID", re.compile(r"(?<![0-9A-Fa-f-])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![0-9A-Fa-f-])")),
         ("MAC", re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")),
+        # host names that embed an IP: ip-10-0-3-184, ip-10-0-3-184.ec2.internal, ec2-54-1-2-3.compute-1...
+        ("HOST", re.compile(rf"(?i)\b[a-z][a-z0-9]{{0,15}}-{DASHED_IP}(?:\.[a-z0-9-]+)*\b")),
         ("IPV4", re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")),
-        ("IPV6", re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b")),
+        # also compressed forms (2600:1f18::1); candidates are validated with ipaddress
+        ("IPV6", re.compile(r"(?<![\w:])(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?![\w:])")),
         ("USER", re.compile(r"(?i)(?<=[\\/]users[\\/])[^\\/\s\"']+")),                     # C:\Users\x, /Users/x
         ("USER", re.compile(r"(?i)(?<=/home/)[^/\s\"']+")),
         ("USER", re.compile(r"\b[A-Z][A-Z0-9-]{1,14}\\([A-Za-z0-9._$-]{2,})\b")),         # DOMAIN\user
@@ -450,6 +567,9 @@ def apply_rules(text, rules):
     for cat, rx in rules:
         if cat == "EMAIL_OBF":
             text = rx.sub(_deobf_email, text)
+            continue
+        if cat == "ARN":
+            text = rx.sub(_arn_sub, text)
             continue
         def sub(m):
             if m.lastindex:  # replace only the captured group
@@ -691,15 +811,17 @@ class Anonymizer:
             return k
         return apply_rules(self.lexicon.apply(apply_rules(k, self.email_rules)), self.other_rules)
 
-    def scrub_str(self, s, key=None, cat=None):
+    def scrub_str(self, s, key=None, cat=None, path=()):
         t = s.strip()
         if t[:1] in "{[" and len(t) > 1:
             try:
-                return json.dumps(self.walk(json.loads(t)), ensure_ascii=False, separators=(",", ":"))
+                inner = path or ((key,) if isinstance(key, str) else ())
+                return json.dumps(self.walk(json.loads(t), path=inner), ensure_ascii=False,
+                                  separators=(",", ":"))
             except ValueError:
                 pass
         cat = column_category(key) if cat is None else cat
-        if cat and s.strip():
+        if cat and t and resolve_category(cat, t):     # None: public AWS endpoint -> free text
             return self.pseudo_field(cat, s)
         s = apply_rules(s, self.email_rules)  # whole e-mail addresses first (also defanged / %40)
         s = self.lexicon.apply(s)             # known names / tenants / keys -> same tokens as their columns
@@ -710,17 +832,19 @@ class Anonymizer:
             s = self.reviewer(s)
         return s
 
-    def walk(self, obj, key=None, cat=None):
+    def walk(self, obj, key=None, cat=None, path=()):
+        """path: keys from the document root ('_source', 'agent'), for dotted FIELD_PATHS."""
         if isinstance(obj, dict):
             out = {}
             for k, v in obj.items():
-                c = json_field_category(obj, k)
-                out[self.scrub_key(k)] = self.walk(v, k, c or "")   # "" = known: not an identity field
+                c = json_field_category(obj, k, path)
+                p = (*path, k) if isinstance(k, str) else path
+                out[self.scrub_key(k)] = self.walk(v, k, c or "", p)   # "" = known: not an identity field
             return out
         if isinstance(obj, list):
-            return [self.walk(v, key, cat) for v in obj]
+            return [self.walk(v, key, cat, path) for v in obj]
         if isinstance(obj, str):
-            return self.scrub_str(obj, key, cat if cat else (None if cat is None else ""))
+            return self.scrub_str(obj, key, cat if cat else (None if cat is None else ""), path)
         return obj
 
 # ---------- progress display ----------
@@ -846,27 +970,34 @@ def prescan(jobs, lexicon, cancel_ok=True):
                 if cats.get(i) and not v.lstrip()[:1] in ("{", "["):
                     lexicon.add(cats[i], v)
                 elif v.lstrip()[:1] in ("{", "["):        # JSON inside a cell (Entities, ExtendedProperties ...)
-                    walk_str(v)
+                    walk_str(v, (header[i],) if i < len(header) else ())
 
-    def walk_str(v):
+    def walk_str(v, path=()):
         try:
-            walk(json.loads(v))
+            walk(json.loads(v), path)
         except ValueError:
             pass
 
-    def walk(obj):
+    def walk(obj, path=()):
         if isinstance(obj, dict):
             for k, v in obj.items():
-                c = json_field_category(obj, k)
+                c = json_field_category(obj, k, path)
+                p = (*path, k) if isinstance(k, str) else path
                 if c and isinstance(v, str) and not v.lstrip()[:1] in ("{", "["):
                     lexicon.add(c, v)
                 elif isinstance(v, str) and v.lstrip()[:1] in ("{", "["):
-                    walk_str(v)
+                    walk_str(v, p)
+                elif c and isinstance(v, list):
+                    for x in v:
+                        if isinstance(x, str):
+                            lexicon.add(c, x)
+                        else:
+                            walk(x, p)
                 else:
-                    walk(v)
+                    walk(v, p)
         elif isinstance(obj, list):
             for v in obj:
-                walk(v)
+                walk(v, path)
 
     for f, _dst, label in jobs:
         cur, suf = label, f.suffix.lower()
@@ -1071,9 +1202,9 @@ def walk_json_top(data, anon, ui, name):
             if isinstance(v, list):
                 res[k] = []
                 for x in v:
-                    res[k].append(anon.walk(x, k)); ui.advance()
+                    res[k].append(anon.walk(x, k, path=(k,))); ui.advance()
             else:
-                res[k] = anon.walk(v, k); ui.advance()
+                res[k] = anon.walk(v, k, path=(k,)); ui.advance()
         return res
     ui.start(name, 1, "values")
     res = anon.walk(data); ui.advance()

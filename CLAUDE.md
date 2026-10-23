@@ -54,7 +54,9 @@ LLM, and that includes you (Claude Code sends everything you read or run to the 
    3. free text → **email rules first** (plain, `%40`, `[@]`/`[.]`, `(at)`/`(dot)`) →
       **lexicon** (same token as the column) → other regex rules (IPs, GUIDs, SIDs, MACs, user
       paths, `DOMAIN\user`, JWT/secrets, Azure resource paths, `DC=`, `*.onmicrosoft.com`,
-      internal FQDNs from `--domains`) → GLiNER2-PII NER on prose chunks → optional LLM reviewer.
+      AWS ARNs (account + names tokenized, structure kept), AWS account ids in `AWSLogs/` paths,
+      access key ids, resource ids (`i-`, `sg-`, `sgr-` …), host names embedding an IP
+      (`ip-10-0-3-184`), internal FQDNs from `--domains`) → GLiNER2-PII NER on prose chunks → optional LLM reviewer.
 4. **Tokens** are deterministic: `HMAC(ANON_KEY, CATEGORY:value.lower())`, so the same value gets
    the same token across files and runs (`USER_1a2b3c4d`, `TENANT_…`, `TKT-1234567`,
    `user_1a2b3c4d@example.com`, IPs in 198.18.0.0/15, `2001:db8::…`). `--map` writes token → original.
@@ -62,7 +64,11 @@ LLM, and that includes you (Claude Code sends everything you read or run to the 
 ### Column classification
 `norm_header()` turns `Custom field (Tenant Name)` → `tenant name`, `userPrincipalName` →
 `user principal name`; `COLUMN_RULES` (ordered regexes, first full match wins) assign categories.
-`COLUMN_ONLY` categories (PROVIDER, VENDOR, SYSTEM, VENDORID, ISSUEID) are replaced in their column
+Dotted names (Wazuh/Elastic `_source.agent.name` headers, or the same nesting in JSON – the walker
+tracks the key path) are looked up in `FIELD_PATHS` (longest lowercase path suffix wins, `None` = keep,
+e.g. `rule.mail`), else `COLUMN_RULES` on the last segment. HOST values that are IPs get the IP token;
+public AWS endpoints (`ec2.amazonaws.com`, `AWS Internal`) fall through to free text.
+`COLUMN_ONLY` categories (PROVIDER, VENDOR, SYSTEM, VENDORID, ISSUEID, GEO, AWSTAG, SERIAL) are replaced in their column
 but not chased through free text. Sentinel entity objects (`{"Type": "account", "Name": …}`) use
 `ENTITY_FIELDS` per entity type. Users can override with `--id-columns 'Header=CAT'`,
 `--keep-columns 'Header'`, extra names with `--terms file`.

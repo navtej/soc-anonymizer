@@ -201,3 +201,80 @@ def build_control_chars_xlsx(folder):
         ws.append(["NT AU_x001E_THORITY\\SYSTEM", f"Priya_x0000_Sharma ran job {i}"])
     wb.save(d / "ctrl.xlsx")
     return d / "ctrl.xlsx"
+
+
+# Wazuh alerts (Kibana/OpenSearch CSV export with flattened '_source.*' headers, and the
+# same alerts as an Elasticsearch NDJSON export). Account, IPs, keys, names: all invented.
+WZ_ACCT = "210987654321"
+WZ_SECRETS = [WZ_ACCT, "10-20-3-184", "10.20.3.184", "10-20-7-9", "10.20.7.9", "54-210-33-7", "54.210.33.7",
+              "2600:1f18:aa:bb::51", "AKIAZZEXAMPLE7QK3WPL", "ASIAZZEXAMPLE9RT4XYZ", "sgr-0a1b2c3d4e5f60718",
+              "i-0f1e2d3c4b5a69788", "AcmeSocAdmin", "priya.sharma", "acme-prod-web", "acme-cloudtrail-logs",
+              "wazuh-mgr-acme", "Pune", "Maharashtra", "India", "203.0.113.77"]
+WZ_CLOUDTRAIL = {
+    "eventVersion": "1.08", "eventSource": "ec2.amazonaws.com", "eventName": "AuthorizeSecurityGroupIngress",
+    "awsRegion": "us-east-1", "sourceIPAddress": "203.0.113.77", "userAgent": "aws-cli/2.15.0 md/ip-10-20-7-9",
+    "recipientAccountId": WZ_ACCT,
+    "userIdentity": {"type": "AssumedRole", "principalId": "AROAZZEXAMPLE1AB2CD3:priya.sharma",
+                     "arn": f"arn:aws:sts::{WZ_ACCT}:assumed-role/AcmeSocAdmin/priya.sharma",
+                     "accountId": WZ_ACCT, "accessKeyId": "ASIAZZEXAMPLE9RT4XYZ",
+                     "sessionContext": {"sessionIssuer": {
+                         "type": "Role", "principalId": "AROAZZEXAMPLE1AB2CD3",
+                         "arn": f"arn:aws:iam::{WZ_ACCT}:role/AcmeSocAdmin", "userName": "AcmeSocAdmin"}}},
+    "responseElements": {"securityGroupRuleSet": {"items": [{
+        "securityGroupRuleId": "sgr-0a1b2c3d4e5f60718",
+        "securityGroupRuleArn": f"arn:aws:ec2:us-east-1:{WZ_ACCT}:security-group-rule/sgr-0a1b2c3d4e5f60718"}]}},
+}
+WZ_HEADERS = [
+    "_id", "_source.timestamp", "_source.rule.level", "_source.rule.description", "_source.rule.mail",
+    "_source.agent.id", "_source.agent.name", "_source.agent.ip", "_source.manager.name",
+    "_source.predecoder.hostname", "_source.location", "_source.full_log", "_source.data.srcuser",
+    "_source.data.dstuser", "_source.data.srcip", "_source.data.command", "_source.data.pwd",
+    "_source.data.aws.eventSource", "_source.data.aws.sourceIPAddress", "_source.data.aws.log_info.log_file",
+    "_source.data.aws.log_info.s3bucket", "_source.data.aws.userIdentity.accessKeyId",
+    "_source.data.aws.userIdentity.accountId", "_source.data.aws.userIdentity.arn",
+    "_source.data.aws.userIdentity.invokedBy",
+    "_source.data.aws.userIdentity.sessionContext.sessionIssuer.principalId",
+    "_source.data.aws.resource.instanceDetails.networkInterfaces",
+    "_source.data.aws.resource.instanceDetails.networkInterfaces.privateDnsName",
+    "_source.data.aws.resource.instanceDetails.networkInterfaces.publicDnsName",
+    "_source.data.aws.resource.instanceDetails.networkInterfaces.ipv6Addresses",
+    "_source.data.aws.resource.instanceDetails.tags",
+    "_source.data.aws.responseElements.securityGroupRuleSet.items.securityGroupRuleId",
+    "_source.GeoLocation.city_name", "_source.GeoLocation.region_name", "_source.GeoLocation.country_name",
+]
+WZ_ROW = [
+    "wz-1", "2026-09-01T10:00:00.000+0000", "5", "sshd: authentication success.", "false",
+    "007", "ip-10-20-3-184", "10.20.3.184", "wazuh-mgr-acme",
+    "ip-10-20-3-184", "/var/log/secure",
+    "Sep  1 10:00:00 ip-10-20-3-184 sshd[4242]: Accepted publickey for priya.sharma from 10.20.7.9 port 51122",
+    "priya.sharma", "root", "10.20.7.9", "sudo cat /home/priya.sharma/.aws/credentials", "/home/priya.sharma",
+    "ec2.amazonaws.com", "ip-10-20-7-9.ec2.internal",
+    f"AWSLogs/{WZ_ACCT}/CloudTrail/us-east-1/2026/09/01/{WZ_ACCT}_CloudTrail_us-east-1_20260901T1000Z_x1.json.gz",
+    "acme-cloudtrail-logs", "AKIAZZEXAMPLE7QK3WPL", WZ_ACCT,
+    f"arn:aws:iam::{WZ_ACCT}:user/priya.sharma", "AWS Internal", "AROAZZEXAMPLE1AB2CD3",
+    json.dumps([{"privateDnsName": "ip-10-20-3-184.ec2.internal", "privateIpAddress": "10.20.3.184",
+                 "publicIp": "54.210.33.7", "subnetId": "subnet-0abc1234def567890"}]),
+    "ip-10-20-3-184.ec2.internal", "ec2-54-210-33-7.compute-1.amazonaws.com", "2600:1f18:aa:bb::51",
+    json.dumps([{"key": "Name", "value": "acme-prod-web"}]), "sgr-0a1b2c3d4e5f60718",
+    "Pune", "Maharashtra", "India",
+]
+
+
+def build_wazuh(folder):
+    d = Path(folder)
+    d.mkdir(parents=True, exist_ok=True)
+    write_csv(d / "wazuh.csv", WZ_HEADERS, [WZ_ROW])
+    hit = {"_index": "wazuh-alerts-4.x-2026.09.01", "_id": "wz-2", "_source": {
+        "rule": {"level": 3, "description": "AWS CloudTrail: ec2 AuthorizeSecurityGroupIngress", "mail": False},
+        "agent": {"id": "000", "name": "wazuh-mgr-acme"}, "manager": {"name": "wazuh-mgr-acme"},
+        "location": "aws-s3", "full_log": json.dumps(WZ_CLOUDTRAIL),
+        "GeoLocation": {"city_name": "Pune", "country_name": "India", "location": {"lat": 18.5, "lon": 73.8}},
+        "data": {"aws": {**WZ_CLOUDTRAIL, "source": "cloudtrail",
+                         "log_info": {"s3bucket": "acme-cloudtrail-logs", "log_file": WZ_ROW[19]},
+                         "resource": {"instanceDetails": {
+                             "instanceId": "i-0f1e2d3c4b5a69788",
+                             "networkInterfaces": [{"privateDnsName": "ip-10-20-3-184.ec2.internal",
+                                                    "ipv6Addresses": ["2600:1f18:aa:bb::51"]}],
+                             "tags": [{"key": "Name", "value": "acme-prod-web"}]}}}}}}
+    (d / "wazuh.ndjson").write_text(json.dumps(hit) + "\n")
+    return d
