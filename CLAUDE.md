@@ -120,8 +120,9 @@ but not chased through free text. Sentinel entity objects (`{"Type": "account", 
 - NER model: `fastino/gliner2-privacy-filter-PII-multi` (GLiNER2-PII, Apache-2.0). One-time
   `uv run soc_anonymize.py --prefetch`, then `HF_HUB_OFFLINE=1`. Name labels use a stricter
   threshold (`--name-threshold 0.6`).
-  `--device auto|cpu|cuda|mps` (`map_location`): auto = CUDA if present, else CPU. MPS is opt-in
-  (couldn't be checked against CPU here: the sandbox has no Metal). `NER.lock` serializes forward passes.
+  `--device auto|cpu|cuda|mps` (`map_location`): auto = CUDA, else MPS, else CPU. MPS gave the same
+  entities as CPU on the user's M2 (synthetic bench), ~2.5x faster; the sandbox here has no Metal,
+  so MPS can't be exercised from Claude Code. `NER.lock` serializes forward passes.
 - LLM reviewer: `--review` against LM Studio (`http://127.0.0.1:1234/v1`, Qwen 3.5 9B MLX 4-bit
   on the user's 16 GB M2). It only *flags* spans that literally occur; `--review-apply` replaces
   them. Non-localhost URLs need `--allow-remote-review`. With the reviewer on, records are

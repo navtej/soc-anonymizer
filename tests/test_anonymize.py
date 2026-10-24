@@ -651,8 +651,7 @@ def test_ner_device_selection(monkeypatch):
     fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False),
                                        backends=types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: True)))
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    assert sa.pick_device("auto") == "cpu"           # MPS only when asked for
-    assert sa.pick_device("mps") == "mps"
+    assert sa.pick_device("auto") == "mps"
     fake_torch.cuda.is_available = lambda: True
     assert sa.pick_device("auto") == "cuda"
     assert sa.pick_device("cpu") == "cpu"
@@ -669,3 +668,6 @@ def test_ner_device_selection(monkeypatch):
     assert seen == {"name": "some/model", "map_location": "cuda"}
     sa.NER("some/model", 0.4, 0.6, "cpu")
     assert seen["map_location"] == "cpu"
+    fake_torch.cuda.is_available = lambda: False
+    fake_torch.backends.mps.is_available = lambda: False
+    assert sa.pick_device("auto") == "cpu"
