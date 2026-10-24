@@ -663,29 +663,42 @@ def prefetch_model(model_name):
     path = snapshot_download(model_name)
     log(f"model cached at {path}\nfrom now on you can run with HF_HUB_OFFLINE=1", style="green")
 
+def pick_device(want="auto"):
+    """'auto': CUDA GPU (cloud box), else CPU. Apple GPU ('mps') is opt-in until its
+    NER output has been checked against CPU on real hardware."""
+    if want != "auto":
+        return want
+    import torch
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
 class NER:
-    def __init__(self, model_name, threshold, name_threshold):
+    lock = threading.Lock()   # one forward pass at a time: the tokenizer isn't thread-safe
+
+    def __init__(self, model_name, threshold, name_threshold, device="auto"):
         self.hits = 0
         err = None
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")   # ops MPS lacks run on CPU
         with CONSOLE.status(f"loading NER model {model_name} ...", spinner="dots"):
             from gliner2 import GLiNER2
             try:
-                self.model = GLiNER2.from_pretrained(model_name)
-            except Exception as e:  # missing from cache / offline / wrong id
+                device = pick_device(device)
+                self.model = GLiNER2.from_pretrained(model_name, map_location=device)
+            except Exception as e:  # missing from cache / offline / wrong id / no such device
                 err = e
         if err:
             sys.exit(f"Could not load NER model '{model_name}': {type(err).__name__}.\n"
                      f"Download it once (model weights only, none of your data is sent):\n"
                      f"  unset HF_HUB_OFFLINE && uv run {Path(sys.argv[0]).name} --prefetch\n"
                      f"or pass --model /path/to/local/model_dir, or use --no-ner.")
-        log(f"NER model: {model_name}")
+        log(f"NER model: {model_name} on {device}")
         self.threshold, self.name_threshold = threshold, max(threshold, name_threshold)
 
     def __call__(self, text):
         if looks_like_blob(text):
             return text
-        out = self.model.extract_entities(text, NER_LABELS, threshold=self.threshold,
-                                          include_confidence=True, max_len=384)
+        with self.lock:
+            out = self.model.extract_entities(text, NER_LABELS, threshold=self.threshold,
+                                              include_confidence=True, max_len=384)
         ents = out.get("entities", out) if isinstance(out, dict) else {}
         found = []
         for label, items in ents.items():
@@ -695,7 +708,8 @@ class NER:
                 if (span and len(span) > 1 and conf >= floor and span in text
                         and not TOKEN_RX.fullmatch(span) and span not in MAPPING):
                     found.append((LABEL_CAT.get(label, "PII"), span))
-        self.hits += len(found)
+        with self.lock:
+            self.hits += len(found)
         for cat, span in sorted(found, key=lambda x: -len(x[1])):  # longest first
             text = text.replace(span, pseudo(cat, span))
         return text
@@ -766,6 +780,7 @@ class Reviewer:
             report.parent.mkdir(parents=True, exist_ok=True)
         self.report = report.open("w", encoding="utf-8") if report else None
         self.cache, self.calls, self.flagged, self.file = {}, 0, 0, ""
+        self.lock = threading.Lock()         # several requests in flight (Anonymizer.workers)
         self.on_call = lambda: None          # progress hook, set by the UI
         log(f"review model: {self.model} at {self.url} "
             f"({'apply' if apply else 'dry run, report only'})")
@@ -811,7 +826,8 @@ class Reviewer:
             return self.cache[text]
         out = text
         for chunk in chunks(text, 2000):
-            self.calls += 1
+            with self.lock:
+                self.calls += 1
             leaks = self._ask(chunk)
             self.on_call()
             for leak in leaks:
@@ -819,10 +835,11 @@ class Reviewer:
                 # accept only real, non-placeholder spans: the LLM can flag, never invent
                 if len(span) < 3 or span not in out or span in MAPPING or TOKEN_RX.fullmatch(span):
                     continue
-                self.flagged += 1
-                if self.report:
-                    self.report.write(json.dumps({"file": self.file, "type": kind, "text": span,
-                                                  "applied": self.apply}, ensure_ascii=False) + "\n")
+                with self.lock:
+                    self.flagged += 1
+                    if self.report:
+                        self.report.write(json.dumps({"file": self.file, "type": kind, "text": span,
+                                                      "applied": self.apply}, ensure_ascii=False) + "\n")
                 if self.apply:
                     cat = re.sub(r"[^A-Z]", "", kind.upper())[:12] or "PII"
                     out = out.replace(span, pseudo(cat, span))
@@ -837,16 +854,41 @@ class Reviewer:
             f"{f' -> {self.report.name}' if self.report else ''}",
             style="yellow" if self.flagged else "green")
 
+def ordered_map(fn, items, workers=1):
+    """fn(item) for each item, yielded in input order. With workers > 1 the calls
+    run in a thread pool, at most 2*workers items ahead of the consumer, so the
+    LLM reviewer has several requests in flight while files still stream (the
+    work is mostly waiting on HTTP; NER takes its lock)."""
+    if workers <= 1:
+        yield from map(fn, items)
+        return
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    pool, pending = ThreadPoolExecutor(workers, thread_name_prefix="scrub"), deque()
+    try:
+        for it in items:
+            pending.append(pool.submit(fn, it))
+            if len(pending) >= 2 * workers:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
 # ---------- recursive walker ----------
 MEMO_MAX_LEN, MEMO_SIZE = 512, 50_000   # scrub_str cache: at most ~60 MB
 
 class Anonymizer:
-    def __init__(self, rules, ner=None, ner_min_len=25, reviewer=None, lexicon=None):
+    def __init__(self, rules, ner=None, ner_min_len=25, reviewer=None, lexicon=None, workers=1):
         self.rules, self.ner, self.ner_min_len = rules, ner, ner_min_len
         self.reviewer, self.lexicon = reviewer, lexicon or Lexicon().compile()
+        self.workers = workers   # records scrubbed concurrently (only pays off with the reviewer)
         self.email_rules = [r for r in rules if r[0] in ("EMAIL", "EMAIL_OBF")]
         self.other_rules = [r for r in rules if r[0] not in ("EMAIL", "EMAIL_OBF")]
         self.memo = {}   # short values repeat a lot (status, tenant, alert title): scrub once
+
+    def map(self, fn, items):
+        return ordered_map(fn, items, self.workers)
 
     def pseudo_field(self, cat, s):
         if cat == "ISSUEKEY":
@@ -1368,26 +1410,31 @@ def process_xlsx_fast(path, out, anon, ui, size_mb):
         ws = wb.create_sheet(apply_rules(title, anon.rules)[:31])
         if hidden:
             ws.sheet_state = "hidden"
-        header = None
+        rows, header = iter(rows), None
         for vals in rows:
             ui.advance()
-            if header is None:
-                if vals:
-                    header = [str(v) if v is not None else None for v in vals]
-                    hc = []
-                    for v in vals:
-                        c = WriteOnlyCell(ws, value=apply_rules(v, anon.rules) if isinstance(v, str) else v)
-                        c.font = bold; hc.append(c)
-                    ws.append(hc)
-                else:
-                    ws.append([])
-                continue
-            outrow = []
+            if vals:
+                header = [str(v) if v is not None else None for v in vals]
+                hc = []
+                for v in vals:
+                    c = WriteOnlyCell(ws, value=apply_rules(v, anon.rules) if isinstance(v, str) else v)
+                    c.font = bold; hc.append(c)
+                ws.append(hc)
+                break
+            ws.append([])
+
+        def scrub_row(vals, header=header):
+            outrow, n = [], 0
             for i, v in enumerate(vals):
                 if isinstance(v, str) and v:
                     v = anon.scrub_str(v, header[i] if i < len(header) else None)
-                    cells += 1
+                    n += 1
                 outrow.append(v)
+            return outrow, n
+
+        for outrow, n in anon.map(scrub_row, rows):
+            ui.advance()
+            cells += n
             ws.append(outrow)
     wb.save(xlsx_out(out))
     note = f"{n_sheets} sheet(s), {cells:,} cells, {size_mb:,.0f} MB streamed: values only"
@@ -1411,32 +1458,39 @@ def process_xlsx_full(path, out, anon, ui):
         last = last_rows[ws.title]
         if ws.title and apply_rules(ws.title, anon.rules) != ws.title:
             ws.title = apply_rules(ws.title, anon.rules)[:31]
-        header = None
-        for row in (ws.iter_rows(max_row=last) if last else []):
+        rows, header = iter(ws.iter_rows(max_row=last) if last else []), None
+        for row in rows:
             ui.advance()
-            if header is None:
-                if any(c.value not in (None, "") for c in row):
-                    header = [str(c.value) if c.value is not None else None for c in row]
-                    for c in row:                  # rules only: keeps real headers intact
-                        if isinstance(c.value, str):
-                            c.value = apply_rules(xl_safe(c.value), anon.rules)
-                continue
+            if any(c.value not in (None, "") for c in row):
+                header = [str(c.value) if c.value is not None else None for c in row]
+                for c in row:                      # rules only: keeps real headers intact
+                    if isinstance(c.value, str):
+                        c.value = apply_rules(xl_safe(c.value), anon.rules)
+                break
+
+        def scrub_row(row, header=header):         # cells are changed in place
+            n_cells = n_formulas = 0
             for i, c in enumerate(row):
                 v = c.value
                 if isinstance(v, str) and v:
                     v = xl_safe(v)
                     if c.data_type == "f":         # formula: scrub string literals, no NER
                         c.value = apply_rules(v, anon.rules)
-                        stats["formulas"] += 1
+                        n_formulas += 1
                     else:
                         c.value = anon.scrub_str(v, header[i] if i < len(header) else None)
-                        stats["cells"] += 1
+                        n_cells += 1
                 cm = getattr(c, "comment", None)
                 if cm:
                     cm.text, cm.author = anon.scrub_str(cm.text), "anonymized"
                 hl = getattr(c, "hyperlink", None)
                 if hl and hl.target:
                     c.hyperlink = anon.scrub_str(hl.target)
+            return n_cells, n_formulas
+
+        for n_cells, n_formulas in anon.map(scrub_row, rows):
+            ui.advance()
+            stats["cells"] += n_cells; stats["formulas"] += n_formulas
         if getattr(ws, "_pivots", None):            # pivot caches hold a raw copy of the data
             stats["pivots"] += len(ws._pivots)
             ws._pivots = []
@@ -1460,8 +1514,9 @@ def anonymize_json_stream(fh, f, anon, ui):
     def array(depth, key=None):
         ind, n = "\n" + "  " * (depth + 1), 0
         f.write("[")
-        for _ in js.elements():
-            f.write(("," if n else "") + ind + json_dump_at(anon.walk(js.value(), key, path=(key,) if key else ()), depth + 1))
+        dump = lambda v: json_dump_at(anon.walk(v, key, path=(key,) if key else ()), depth + 1)
+        for s in anon.map(dump, (js.value() for _ in js.elements())):   # parsed in order, here
+            f.write(("," if n else "") + ind + s)
             n += 1; ui.advance()
         f.write("\n" + "  " * depth + "]" if n else "]")
 
@@ -1547,18 +1602,19 @@ def process_file(path, out, anon, ui, xlsx_full_max_mb=40.0, label=None):
             with out.open("w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f, delimiter=delim, lineterminator=eol)
                 w.writerow(header)
-                for r in rows:
-                    w.writerow([anon.scrub_str(c, header[i] if i < len(header) else None)
-                                for i, c in enumerate(r)])
+                scrub_row = lambda r: [anon.scrub_str(c, header[i] if i < len(header) else None)
+                                       for i, c in enumerate(r)]
+                for r in anon.map(scrub_row, rows):
+                    w.writerow(r)
                     ui.advance()
         elif suf in (".ndjson", ".jsonl") or (suf == ".json" and is_ndjson(fh)):
             ui.start(name, size, "records", where)
             with out.open("w", encoding="utf-8") as f:
-                for l in fh:
-                    if l.strip():
-                        f.write(json.dumps(anon.walk(json.loads(l)), ensure_ascii=False,
-                                           separators=(",", ":")) + "\n")
-                        ui.advance()
+                dump = lambda l: json.dumps(anon.walk(json.loads(l)), ensure_ascii=False,
+                                            separators=(",", ":")) + "\n"
+                for s in anon.map(dump, (l for l in fh if l.strip())):
+                    f.write(s)
+                    ui.advance()
         elif suf == ".json":
             ui.start(name, size, "records", where)
             with out.open("w", encoding="utf-8") as f:
@@ -1566,9 +1622,11 @@ def process_file(path, out, anon, ui, xlsx_full_max_mb=40.0, label=None):
         else:                                                 # .log, .txt and anything else: per line
             ui.start(name, size, "lines", where)
             with out.open("w", encoding="utf-8", newline="") as f:
-                for l in fh:
+                def scrub_line(l):
                     body = l.rstrip("\r\n")
-                    f.write(anon.scrub_str(body) + l[len(body):] if body.strip() else l)
+                    return anon.scrub_str(body) + l[len(body):] if body.strip() else l
+                for s in anon.map(scrub_line, fh):
+                    f.write(s)
                     ui.advance()
     ui.finish(name)
 
@@ -1593,6 +1651,9 @@ def main():
     ap.add_argument("--name-threshold", type=float, default=0.6,
                     help="stricter threshold for person/name labels (model over-predicts names)")
     ap.add_argument("--no-ner", action="store_true", help="rules only (fast, no model)")
+    ap.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"),
+                    help="where the NER model runs; auto = CUDA GPU if present, else CPU "
+                         "(mps = Apple GPU, opt-in)")
     ap.add_argument("--map", type=Path, help="write token->original map (SENSITIVE, keep local)")
     lx = ap.add_argument_group("identity columns & lexicon")
     lx.add_argument("--terms", type=Path,
@@ -1623,6 +1684,10 @@ def main():
                     help="JSONL of flagged spans (SENSITIVE: contains the leaked values)")
     rv.add_argument("--review-min-len", type=int, default=20,
                     help="only review strings at least this long (skips short field values)")
+    rv.add_argument("--review-workers", type=int, default=4,
+                    help="records reviewed in parallel, i.e. LLM requests in flight (default: 4). "
+                         "Match the server: LM Studio 'Max Concurrent Predictions', vLLM / "
+                         "llama-server --parallel on a GPU box can take 16+")
     rv.add_argument("--allow-remote-review", action="store_true",
                     help="permit a non-localhost --review-url (private cloud endpoint only)")
     a = ap.parse_args()
@@ -1653,7 +1718,7 @@ def main():
              "started": time.monotonic()}
 
     def run():
-        ner = None if a.no_ner else NER(a.model, a.threshold, a.name_threshold)  # fail fast
+        ner = None if a.no_ner else NER(a.model, a.threshold, a.name_threshold, a.device)  # fail fast
         reviewer = Reviewer(a.review_url, a.review_model, a.review_apply, a.review_report,
                             a.allow_remote_review, a.review_min_len) if a.review else None
         state["reviewer"] = reviewer
@@ -1681,7 +1746,8 @@ def main():
         log(lexicon.compile().summary())
         # internal domains: --domains plus those learnt (UPN suffixes, agent domains, mailboxes)
         anon = Anonymizer(build_rules(sorted(d for d in lexicon.domains if "." in d)), ner,
-                          reviewer=reviewer, lexicon=lexicon)
+                          reviewer=reviewer, lexicon=lexicon,
+                          workers=max(1, a.review_workers) if reviewer else 1)
         try:
             with UI(len(jobs), ner, reviewer, enabled=not a.no_progress) as ui:
                 state["ui"] = ui

@@ -550,3 +550,122 @@ def test_failed_file_leaves_no_partial_output(tmp_path):
     r = run(["broken.ndjson", "-o", "out", "--no-ner"], tmp_path, check=False)
     assert r.returncode == 1 and "broken.ndjson" in r.stderr
     assert not (tmp_path / "out" / "broken.ndjson").exists()
+
+
+# --------------------------------------------------------------------------- parallel review, NER device
+
+def test_ordered_map_keeps_order_and_runs_concurrently():
+    sa = load_module()
+    import threading
+    live, peak, lock = [0], [0], threading.Lock()
+
+    def slow(i):
+        with lock:
+            live[0] += 1; peak[0] = max(peak[0], live[0])
+        time.sleep(0.02 * (i % 3))            # later items often finish first
+        with lock:
+            live[0] -= 1
+        return i * i
+
+    assert list(sa.ordered_map(slow, range(40), workers=8)) == [i * i for i in range(40)]
+    assert peak[0] > 1
+    assert list(sa.ordered_map(slow, range(5), workers=1)) == [0, 1, 4, 9, 16]
+
+    def boom(i):
+        if i == 7:
+            raise ValueError("bad record")
+        return i
+    with pytest.raises(ValueError, match="bad record"):
+        list(sa.ordered_map(boom, range(50), workers=4))
+
+
+def _fake_reviewer(sa, threading):
+    """A Reviewer without the HTTP server: it flags the invented codename 'Zorblax'
+    after a short delay, and records how many requests were in flight at once."""
+    rv = object.__new__(sa.Reviewer)
+    rv.url, rv.apply, rv.min_len, rv.timeout, rv.model = "http://127.0.0.1:1/v1", True, 20, 5, "stub"
+    rv.report, rv.cache, rv.calls, rv.flagged, rv.file = None, {}, 0, 0, ""
+    rv.lock, rv.on_call = threading.Lock(), lambda: None
+    rv.live, rv.peak, plock = 0, 0, threading.Lock()
+
+    def ask(text):
+        with plock:
+            rv.live += 1; rv.peak = max(rv.peak, rv.live)
+        time.sleep(0.01)
+        with plock:
+            rv.live -= 1
+        return [{"text": "Zorblax", "type": "PROJECT"}] if "Zorblax" in text else []
+    rv._ask = ask
+    return rv
+
+
+def test_parallel_review_output_matches_sequential(tmp_path):
+    """--review-workers > 1 scrubs records in a thread pool: every format must come
+    out byte-for-byte as in a sequential run, in the same order."""
+    import threading
+    from openpyxl import Workbook, load_workbook
+    sa = load_module()
+    src = tmp_path / "in"; src.mkdir()
+    note = lambda i: f"Analyst {i} saw project Zorblax beaconing from 10.1.{i % 250}.7 during triage"
+    fixtures.write_csv(src / "t.csv", ["Assignee", "Description"],
+                       [[f"user{i}", note(i)] for i in range(60)])
+    (src / "t.ndjson").write_text("".join(json.dumps({"user": f"u{i}", "msg": note(i)}) + "\n"
+                                          for i in range(60)))
+    (src / "t.json").write_text(json.dumps({"value": [{"Description": note(i)} for i in range(60)]}))
+    (src / "t.log").write_text("".join(note(i) + "\n" for i in range(60)))
+    wb = Workbook(); ws = wb.active; ws.title = "Alerts"
+    ws.append(["Assignee", "Description"])
+    for i in range(60):
+        ws.append([f"user{i}", note(i)])
+    wb.save(src / "t.xlsx")
+
+    def run_with(workers, xlsx_full_max_mb):
+        rv = _fake_reviewer(sa, threading)
+        anon = sa.Anonymizer(sa.build_rules([]), reviewer=rv, workers=workers)
+        out = tmp_path / f"out{workers}_{xlsx_full_max_mb}"
+        with sa.UI(5, None, rv, enabled=False) as ui:
+            for f in sorted(src.iterdir()):
+                sa.process_file(f, out / f.name, anon, ui, xlsx_full_max_mb)
+        return out, rv
+
+    for mb in (40.0, 0.0):                         # XLSX full-fidelity and streamed paths
+        seq, rv1 = run_with(1, mb)
+        par, rv8 = run_with(8, mb)
+        assert rv1.peak == 1 and rv8.peak > 1, (rv1.peak, rv8.peak)
+        assert rv8.flagged == rv1.flagged > 0
+        for f in sorted(seq.iterdir()):
+            if f.suffix == ".xlsx":
+                a = [r for r in load_workbook(f).active.iter_rows(values_only=True)]
+                b = [r for r in load_workbook(par / f.name).active.iter_rows(values_only=True)]
+                assert a == b and len(a) == 61 and not any("Zorblax" in r[1] for r in a)
+            else:
+                assert f.read_bytes() == (par / f.name).read_bytes(), f.name
+                assert "Zorblax" not in f.read_text(), f.name
+        rows = read_csv(par / "t.csv")
+        assert [r[1].split()[1] for r in rows[1:]] == [str(i) for i in range(60)]   # order kept
+
+
+def test_ner_device_selection(monkeypatch):
+    import types
+    sa = load_module()
+    fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False),
+                                       backends=types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: True)))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    assert sa.pick_device("auto") == "cpu"           # MPS only when asked for
+    assert sa.pick_device("mps") == "mps"
+    fake_torch.cuda.is_available = lambda: True
+    assert sa.pick_device("auto") == "cuda"
+    assert sa.pick_device("cpu") == "cpu"
+
+    seen = {}
+
+    class FakeGLiNER2:
+        @classmethod
+        def from_pretrained(cls, name, **kw):
+            seen.update(kw, name=name)
+            return cls()
+    monkeypatch.setitem(sys.modules, "gliner2", types.SimpleNamespace(GLiNER2=FakeGLiNER2))
+    sa.NER("some/model", 0.4, 0.6)                  # auto -> cuda with the fake torch
+    assert seen == {"name": "some/model", "map_location": "cuda"}
+    sa.NER("some/model", 0.4, 0.6, "cpu")
+    assert seen["map_location"] == "cpu"

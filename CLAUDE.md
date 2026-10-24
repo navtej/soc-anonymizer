@@ -120,9 +120,15 @@ but not chased through free text. Sentinel entity objects (`{"Type": "account", 
 - NER model: `fastino/gliner2-privacy-filter-PII-multi` (GLiNER2-PII, Apache-2.0). One-time
   `uv run soc_anonymize.py --prefetch`, then `HF_HUB_OFFLINE=1`. Name labels use a stricter
   threshold (`--name-threshold 0.6`).
+  `--device auto|cpu|cuda|mps` (`map_location`): auto = CUDA if present, else CPU. MPS is opt-in
+  (couldn't be checked against CPU here: the sandbox has no Metal). `NER.lock` serializes forward passes.
 - LLM reviewer: `--review` against LM Studio (`http://127.0.0.1:1234/v1`, Qwen 3.5 9B MLX 4-bit
   on the user's 16 GB M2). It only *flags* spans that literally occur; `--review-apply` replaces
-  them. Non-localhost URLs need `--allow-remote-review`.
+  them. Non-localhost URLs need `--allow-remote-review`. With the reviewer on, records are
+  scrubbed in a thread pool (`ordered_map`, `--review-workers`, default 4) so several LLM requests
+  are in flight; output order and bytes are identical to a sequential run (test enforces this).
+  Shared state touched from workers: `memo`, `MAPPING` (deterministic tokens, so races are
+  harmless), `Reviewer` counters/report (under `Reviewer.lock`).
 
 ## sample_files.py
 Exact `ceil(N·p%)` random records per file/sheet (`-p`, default 10), `--seed` for reproducibility
