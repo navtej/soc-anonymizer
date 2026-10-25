@@ -128,6 +128,10 @@ but not chased through free text. Sentinel entity objects (`{"Type": "account", 
   them. Non-localhost URLs need `--allow-remote-review`. With the reviewer on, records are
   scrubbed in a thread pool (`ordered_map`, `--review-workers`, default 4) so several LLM requests
   are in flight; output order and bytes are identical to a sequential run (test enforces this).
+  `setup_ubuntu_gpu.sh` (run as root on the instance) prepares an Ubuntu GPU host (e.g. Linode)
+  to run the whole anonymizer there: vLLM on 127.0.0.1:1234 (default `--review-url`), NER model
+  prefetch (required: `soc_anonymize.py` next to the script), `HF_HUB_OFFLINE=1` in `~/.bashrc`,
+  tmux, `/root/soc/{in,out,.private}`; untested here (no GPU).
   Shared state touched from workers: `memo`, `MAPPING` (deterministic tokens, so races are
   harmless), `Reviewer` counters/report (under `Reviewer.lock`).
 

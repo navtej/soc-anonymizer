@@ -27,6 +27,26 @@ Check the `identity columns [...]` lines at the start of each run; fix misses wi
 
 **Run real data in your own terminal, not through Claude Code** – see `CLAUDE.md`.
 
+## Running on a cloud GPU (Ubuntu, e.g. Linode)
+
+`setup_ubuntu_gpu.sh` prepares a fresh Ubuntu NVIDIA GPU host to run the anonymizer with the reviewer
+on the node itself: NVIDIA driver, vLLM with a model (default `Qwen/Qwen3-8B-AWQ`, fits the
+20 GB RTX 4000 Ada) on `127.0.0.1:1234` (the default `--review-url`; localhost only, firewall
+allows SSH only), the anonymizer's dependencies, the NER model (`--prefetch`), `HF_HUB_OFFLINE=1` in root's
+`~/.bashrc`, `tmux` for long runs, and `/root/soc/{in,out,.private}` (mode 700).
+
+```bash
+ssh root@<host> mkdir -p soc-anonymizer
+scp setup_ubuntu_gpu.sh soc_anonymize.py sample_files.py root@<host>:soc-anonymizer/
+ssh root@<host> bash soc-anonymizer/setup_ubuntu_gpu.sh   # first run: driver, reboot, run again
+```
+
+It prints the full anonymizer command at the end (`--device cuda --review --review-workers 16`).
+Use the same `ANON_KEY` as on the Mac so tokens match earlier runs. Override the model with
+`MODEL=... bash setup_ubuntu_gpu.sh`. The raw exports and the map sit on the instance's disk, and
+cloud providers (Linode included) bill GPU instances until they are **deleted**, so copy back
+`out/` and delete the instance.
+
 ## Tests
 
 ```bash
