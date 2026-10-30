@@ -97,6 +97,26 @@ but not chased through free text. Sentinel entity objects (`{"Type": "account", 
   are read, scrubbed and written one at a time. `JsonStream` is a small stdlib pull parser
   (`raw_decode` per element); output keeps the `json.dumps(indent=2)` layout. Progress for text
   files follows bytes read. A failed file's partial output is removed.
+- **Atomic output**: `process_file` writes `.part-<name>` (same folder and suffix) and
+  `commit_output` fsyncs and renames it, so a file under its final name is always complete, even
+  after a hard kill. A failed file's output (also an older run's) is removed; leftover parts are
+  removed at start.
+- **`--resume`**: skips files listed as finished in `<outdir>.manifest.json` (next to the outdir, not
+  in it: the outdir is what gets shared). **Every input is still pre-scanned**: the lexicon must come
+  from all inputs or names known only from finished files leak into the rest (test enforces this and
+  byte-identical output). The manifest holds file names, counts, input size + mtime and `run_settings`
+  (customer-identifying values and the key only as keyed `fingerprint`s). A different key, setting or
+  input is refused, as are outputs without a manifest (`--resume` on an empty outdir is a first run).
+  A run without `--resume` starts a new manifest. Written per finished file, in this order: output,
+  `--map` (merged back on resume), manifest; a crash in between only redoes that file. `--review-report`
+  is appended on resume and flushed per span, so a redone file's spans can appear twice.
+- **Progress log** (`ProgressLog`, `<outdir>.progress.log` or `--progress-log`): append-only JSON lines,
+  synced per event. File names and counts only: exception *types*, never messages (they can quote
+  cells); `--domains` and column lists as counts. No `run_end` means a hard kill.
+- **Review outages**: `Reviewer._http` waits out connection errors, timeouts, 5xx and unparsable bodies
+  for `--review-retry-minutes` (default 60), backing off 5-60 s. 4xx is not retried (`ReviewError`,
+  exit 1). Out of retries: `ReviewError`, partial removed, report and map saved, exit 75
+  (`EXIT_RETRY_LATER`), `--resume` continues. The first attempt of the startup model probe fails at once.
 - **Ctrl-C is immediate**: work runs in a worker thread (`run_cancellable`); main thread waits,
   on Ctrl-C removes the half-written output, flushes reports/map, exits 130.
 - **NER input is bounded**: `chunks()` splits ≤1000 chars (also inside long single lines),
@@ -104,7 +124,8 @@ but not chased through free text. Sentinel entity objects (`{"Type": "account", 
 - **Large XLSX**: decided by *uncompressed sheet XML size* (`xlsx_sheet_mb`, default 40 MB):
   small → full-fidelity openpyxl (formatting, comments, links, formulas' string literals, metadata
   scrubbed, pivot caches dropped); large → `xlsx_stream` (rows of one sheet at a time) +
-  write-only, values only. `xlsx_stream` reads with calamine `iter_rows()` (~10x faster than
+  write-only, values only (`close_write_only` closes the sheets on abort, else openpyxl prints
+  `Exception ignored in WriteOnlyWorksheet._write_rows` at exit). `xlsx_stream` reads with calamine `iter_rows()` (~10x faster than
   openpyxl; holds the sheet being read, about its XML size); books over `CALAMINE_MAX_MB`
   (1000) fall back to openpyxl read-only (flat memory). calamine skips empty leading columns
   (padded back from `sheet.start`). `_xHHHH_` escapes (e.g. `_x000D_`) are decoded before

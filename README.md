@@ -174,6 +174,34 @@ fix misses with `--id-columns`, `--keep-columns` or `--terms`. Non-identity colu
 severity, dates, scores, tactics, alert titles) pass through unchanged; bare numbers in prose
 (ports, counts, event IDs) are kept.
 
+### Interrupted runs
+
+Outputs appear under their final name only when complete (`.part-<name>` until then), so what is in
+the output folder is always finished, even after a hard kill. To continue, run the same command with
+`--resume`:
+
+```bash
+uv run soc_anonymize.py ~/soc/in -o ~/soc/out --map ~/soc/.private/mapping.json \
+  --review --review-apply --review-report ~/soc/.private/review_report.jsonl --resume
+```
+
+- Pass **all** the original inputs. Finished files are skipped but still pre-scanned, because names
+  known only from them must still be replaced in the remaining files. The result is byte-identical to
+  an uninterrupted run (given a deterministic reviewer).
+- `--resume` is refused if the key, a setting that changes the output, or any input differs from the
+  earlier run, so outputs of different runs never mix. Without `--resume` everything is redone.
+- `--map` is merged and `--review-report` is appended to. Spans of a file that was redone can appear
+  twice in the report.
+- If the review server goes down or times out, the run waits and retries for `--review-retry-minutes`.
+  After that it removes the partial file and exits with code 75: fix the server and `--resume`. An
+  HTTP 4xx is not retried (exit code 1).
+
+Two files sit next to the output folder, not in it, so they aren't shared with the outputs:
+`<outdir>.progress.log`, an append-only JSON-lines history of the run (arguments, file start, finish
+with records and seconds, failures, exit reason; no `run_end` means it was killed), and
+`<outdir>.manifest.json`, the record `--resume` reads. Both hold file names and counts only, never
+cell values; the key and values like `--domains` appear only as keyed fingerprints or counts.
+
 ### Arguments
 
 | Argument | Default | Description |
@@ -182,6 +210,8 @@ severity, dates, scores, tactics, alert titles) pass through unchanged; bare num
 | `-o`, `--outdir` | `./anonymized` | Output folder (must not be inside an input folder) |
 | `--domains` | – | Internal DNS suffixes, comma-separated (`corp.local,acme.internal`); host names under them are tokenized |
 | `--map` | – | Write the token → original map (**sensitive**, keep private) |
+| `--resume` | off | Continue an interrupted run: same inputs, output folder and settings (see above) |
+| `--progress-log` | `<outdir>.progress.log` | Append-only log of the run: file names and counts only |
 | `--no-ner` | off | Rules and lexicon only: fast, no model |
 | `--model` | `fastino/gliner2-privacy-filter-PII-multi` | Hugging Face id or local directory of the GLiNER2 PII model |
 | `--prefetch` | – | Download the NER model into the local cache and exit |
@@ -213,6 +243,7 @@ severity, dates, scores, tactics, alert titles) pass through unchanged; bare num
 | `--review-report` | `review_report.jsonl` | JSONL of flagged spans (**sensitive**: contains the leaked values) |
 | `--review-min-len` | `20` | Only review strings at least this long |
 | `--review-workers` | `4` | Records reviewed in parallel (LLM requests in flight); match the server's concurrency |
+| `--review-retry-minutes` | `60` | Wait this long for a review server that is down or timing out, then stop with exit code 75 |
 | `--allow-remote-review` | off | Permit a non-localhost `--review-url` (private endpoint only) |
 
 ### Limitations

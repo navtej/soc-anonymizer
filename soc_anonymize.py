@@ -66,8 +66,12 @@ Optional: pin dependencies for reproducible runs
 Second pass with LM Studio (server on http://127.0.0.1:1234):
   uv run soc_anonymize.py data/* -o out/ --domains corp.local \
       --review --review-apply --review-report review.jsonl
+
+Interrupted (hard kill, review server gone for too long)? Same command plus --resume.
+Outputs appear under their final name only when complete; out.progress.log and
+out.manifest.json next to the outdir record what happened and what is finished.
 """
-import argparse, csv, hashlib, hmac, io, ipaddress, itertools, json, logging, os, re, signal, sys, threading, time, warnings
+import argparse, csv, hashlib, hmac, http.client, io, ipaddress, itertools, json, logging, os, re, signal, sys, threading, time, warnings
 import urllib.error, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
@@ -768,39 +772,91 @@ REVIEW_SCHEMA = {
     "required": ["leaks"],
 }
 
+EXIT_RETRY_LATER = 75        # EX_TEMPFAIL: the review server is away, --resume can continue
+RETRY_WAIT = (5, 60)         # seconds between attempts while it is away: first, then doubling up to
+
+class ReviewError(Exception):
+    """The reviewer can't go on: the run stops (a file left unreviewed would be a silent
+    leak) and the current file's partial output is removed, so --resume can continue."""
+    def __init__(self, msg, exit_code=EXIT_RETRY_LATER):
+        super().__init__(msg)
+        self.exit_code = exit_code
+
 class Reviewer:
     LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
     def __init__(self, url, model=None, apply=False, report=None, allow_remote=False,
-                 min_len=20, timeout=180):
+                 min_len=20, timeout=180, retry_minutes=60, append_report=False):
         host = urlparse(url).hostname or ""
         if host not in self.LOCAL_HOSTS and not allow_remote:
             sys.exit(f"--review-url host '{host}' is not local. If it is your PRIVATE "
                      "endpoint, re-run with --allow-remote-review.")
         self.url, self.apply, self.min_len, self.timeout = url.rstrip("/"), apply, min_len, timeout
+        self.retry_seconds = retry_minutes * 60
+        self.down_since = None               # monotonic start of the outage in progress
+        self.gave_up = threading.Event()     # one request ran out of retries: the others stop too
+        self.on_event = lambda event, **fields: None    # progress log hook, set by main
+        self.lock = threading.Lock()         # several requests in flight (Anonymizer.workers)
         self.model = model or self._loaded_model()
         if report:
             report.parent.mkdir(parents=True, exist_ok=True)
-        self.report = report.open("w", encoding="utf-8") if report else None
+        self.report = report.open("a" if append_report else "w", encoding="utf-8") if report else None
         self.cache, self.calls, self.flagged, self.file = {}, 0, 0, ""
-        self.lock = threading.Lock()         # several requests in flight (Anonymizer.workers)
         self.on_call = lambda: None          # progress hook, set by the UI
         log(f"review model: {self.model} at {self.url} "
             f"({'apply' if apply else 'dry run, report only'})")
 
-    def _http(self, path, body=None):
+    def _http(self, path, body=None, retry=True):
+        """Connection errors, timeouts and 5xx are waited out for --review-retry-minutes
+        (a restarting server looks like all three). 4xx means the request or the setup is
+        wrong, so waiting won't help."""
         req = urllib.request.Request(
             self.url + path, data=json.dumps(body).encode() if body else None,
             headers={"Content-Type": "application/json", "Authorization": "Bearer lm-studio"})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read())
-        except urllib.error.URLError as e:
-            sys.exit(f"review server unreachable at {self.url}: {e}. "
-                     "Start it in LM Studio (Developer tab) or with `lms server start`.")
+        deadline, wait = time.monotonic() + self.retry_seconds, RETRY_WAIT[0]
+        while True:
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    out = json.loads(r.read())
+                self._outage_over()
+                return out
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    raise ReviewError(f"review server at {self.url} refused the request: HTTP {e.code}.",
+                                      exit_code=1) from e
+                why = f"HTTP {e.code}"
+            except (OSError, http.client.HTTPException, ValueError) as e:  # URLError is an OSError
+                why = str(getattr(e, "reason", "") or type(e).__name__)
+            left = deadline - time.monotonic()
+            if not retry or left <= 0 or self.gave_up.is_set():
+                self.gave_up.set()
+                raise ReviewError(f"review server unreachable at {self.url}: {why}. "
+                                  "Start it in LM Studio (Developer tab), with `lms server start`, or "
+                                  "restart your vLLM server.")
+            self._outage_begins(why)
+            time.sleep(min(wait, left))
+            wait = min(wait * 2, RETRY_WAIT[1])
+
+    def _outage_begins(self, why):
+        with self.lock:
+            if self.down_since is not None:
+                return
+            self.down_since = time.monotonic()
+        log(f"review server unavailable ({why}), retrying for up to {self.retry_seconds / 60:g} min",
+            style="yellow")
+        self.on_event("review_outage")
+
+    def _outage_over(self):
+        if self.down_since is None:
+            return
+        with self.lock:
+            since, self.down_since = self.down_since, None
+        if since is not None:
+            log(f"review server back after {time.monotonic() - since:.0f}s", style="green")
+            self.on_event("review_recovered", seconds=round(time.monotonic() - since, 1))
 
     def _loaded_model(self):
-        ids = [m["id"] for m in self._http("/models").get("data", [])
+        ids = [m["id"] for m in self._http("/models", retry=False).get("data", [])
                if "embed" not in m["id"].lower()]
         if not ids:
             sys.exit("No model loaded in LM Studio. Run `lms load <model>` or pass --review-model.")
@@ -843,6 +899,7 @@ class Reviewer:
                     if self.report:
                         self.report.write(json.dumps({"file": self.file, "type": kind, "text": span,
                                                       "applied": self.apply}, ensure_ascii=False) + "\n")
+                        self.report.flush()      # survives a hard kill
                 if self.apply:
                     cat = re.sub(r"[^A-Z]", "", kind.upper())[:12] or "PII"
                     out = out.replace(span, pseudo(cat, span))
@@ -994,7 +1051,7 @@ class UI:
         self.n_files, self.files_done = n_files, 0
         self.total = self.progress.add_task(fit("TOTAL"), total=n_files, unit="files", info="",
                                             count=f"0/{n_files}")
-        self.task, self.t0, self.n_ok, self.n_fail = None, 0.0, 0, 0
+        self.task, self.t0, self.n_ok, self.n_fail, self.n_skip = None, 0.0, 0, 0, 0
         if reviewer:
             reviewer.on_call = self.refresh
 
@@ -1046,6 +1103,7 @@ class UI:
         self._line("✗", "red", name, why)
 
     def skip(self, name, why):
+        self.n_skip += 1
         self._tick_total()
         self._line("–", "yellow", name, why)
 
@@ -1408,40 +1466,57 @@ def process_xlsx_fast(path, out, anon, ui, size_mb):
     ui.start(path.name, xlsx_est_rows(path), "rows")
     wb = Workbook(write_only=True)
     wb.properties.creator = wb.properties.lastModifiedBy = "anonymized"
-    for title, hidden, rows in xlsx_stream(path):
-        n_sheets += 1
-        ws = wb.create_sheet(apply_rules(title, anon.rules)[:31])
-        if hidden:
-            ws.sheet_state = "hidden"
-        rows, header = iter(rows), None
-        for vals in rows:
-            ui.advance()
-            if vals:
-                header = [str(v) if v is not None else None for v in vals]
-                hc = []
-                for v in vals:
-                    c = WriteOnlyCell(ws, value=apply_rules(v, anon.rules) if isinstance(v, str) else v)
-                    c.font = bold; hc.append(c)
-                ws.append(hc)
-                break
-            ws.append([])
+    try:
+        for title, hidden, rows in xlsx_stream(path):
+            n_sheets += 1
+            ws = wb.create_sheet(apply_rules(title, anon.rules)[:31])
+            if hidden:
+                ws.sheet_state = "hidden"
+            rows, header = iter(rows), None
+            for vals in rows:
+                ui.advance()
+                if vals:
+                    header = [str(v) if v is not None else None for v in vals]
+                    hc = []
+                    for v in vals:
+                        c = WriteOnlyCell(ws, value=apply_rules(v, anon.rules) if isinstance(v, str) else v)
+                        c.font = bold; hc.append(c)
+                    ws.append(hc)
+                    break
+                ws.append([])
 
-        def scrub_row(vals, header=header):
-            outrow, n = [], 0
-            for i, v in enumerate(vals):
-                if isinstance(v, str) and v:
-                    v = anon.scrub_str(v, header[i] if i < len(header) else None)
-                    n += 1
-                outrow.append(v)
-            return outrow, n
+            def scrub_row(vals, header=header):
+                outrow, n = [], 0
+                for i, v in enumerate(vals):
+                    if isinstance(v, str) and v:
+                        v = anon.scrub_str(v, header[i] if i < len(header) else None)
+                        n += 1
+                    outrow.append(v)
+                return outrow, n
 
-        for outrow, n in anon.map(scrub_row, rows):
-            ui.advance()
-            cells += n
-            ws.append(outrow)
-    wb.save(xlsx_out(out))
+            for outrow, n in anon.map(scrub_row, rows):
+                ui.advance()
+                cells += n
+                ws.append(outrow)
+        wb.save(xlsx_out(out))
+    except BaseException:
+        close_write_only(wb)
+        raise
     note = f"{n_sheets} sheet(s), {cells:,} cells, {size_mb:,.0f} MB streamed: values only"
     return note + (", -> .xlsx" if path.suffix.lower() == ".xlsm" else "")
+
+def close_write_only(wb):
+    """Aborted write-only book: close its sheets now. Left to the garbage collector, each
+    sheet's row writer runs after its spool file is closed and prints 'Exception ignored
+    in WriteOnlyWorksheet._write_rows ... I/O operation on closed file'."""
+    for ws in wb.worksheets:
+        try:
+            if not ws.closed:
+                ws.close()
+            if ws._writer is not None:
+                ws._writer.cleanup()               # the spool file
+        except Exception:
+            pass
 
 def xlsx_out(out):
     """Values-only books can't carry macros: .xlsm is written as .xlsx."""
@@ -1579,18 +1654,60 @@ def collect(inputs, outdir, extra_skip=(), recursive=True):
         out.append((f, dst, str(rel)))
     return out
 
-def process_file(path, out, anon, ui, xlsx_full_max_mb=40.0, label=None):
-    out.parent.mkdir(parents=True, exist_ok=True)
+def part_path(dst):
+    """Where dst is written until it is complete. Same folder, so the rename is atomic;
+    same suffix (xlsx_out); hidden, so collect() never takes it for an input."""
+    return dst.with_name(".part-" + dst.name)
+
+def write_atomic(path, text):
+    """Replace path in one step, durably: it holds the old or the new text, never a part."""
+    tmp = path.with_name("." + path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def commit_output(part, dst):
+    """A file on disk under its final name is always complete, even after a hard kill
+    or a power loss. Streamed books turn .xlsm into .xlsx; full-fidelity ones keep it."""
+    src, final = (part, dst) if part.exists() else (xlsx_out(part), xlsx_out(dst))
+    with src.open("rb") as f:
+        os.fsync(f.fileno())
+    os.replace(src, final)
+    fd = os.open(final.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def process_file(path, dst, anon, ui, xlsx_full_max_mb=40.0, label=None):
+    """True if dst was written, False if the file type is skipped. Any failure leaves
+    no partial file behind."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    out = part_path(dst)
+    try:
+        return _process_file(path, dst, out, anon, ui, xlsx_full_max_mb, label)
+    except BaseException:
+        remove_partial(out)
+        raise
+
+def _process_file(path, dst, out, anon, ui, xlsx_full_max_mb, label):
     name = label or path.name
     if anon.reviewer:
         anon.reviewer.file = str(path)
     suf = path.suffix.lower()
     if suf == ".xls":
-        return ui.skip(name, "legacy .xls not supported - re-save as .xlsx")
+        ui.skip(name, "legacy .xls not supported - re-save as .xlsx")
+        return False
     if suf == ".gz":
-        return ui.skip(name, "compressed - decompress first (or sample it with sample_files.py)")
+        ui.skip(name, "compressed - decompress first (or sample it with sample_files.py)")
+        return False
     if suf in (".xlsx", ".xlsm"):
-        return ui.finish(name, process_xlsx(path, out, anon, ui, xlsx_full_max_mb))
+        note = process_xlsx(path, out, anon, ui, xlsx_full_max_mb)
+        commit_output(out, dst)
+        ui.finish(name, note)
+        return True
     # text formats: streamed record by record; the bar follows the bytes read
     size = path.stat().st_size
     with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as fh:  # newline="" keeps \r\n
@@ -1631,7 +1748,9 @@ def process_file(path, out, anon, ui, xlsx_full_max_mb=40.0, label=None):
                 for s in anon.map(scrub_line, fh):
                     f.write(s)
                     ui.advance()
+    commit_output(out, dst)
     ui.finish(name)
+    return True
 
 def remove_partial(dst):
     for p in {dst, xlsx_out(dst)}:
@@ -1639,6 +1758,104 @@ def remove_partial(dst):
             p.unlink(missing_ok=True)
         except OSError:
             pass
+
+class ProgressLog:
+    """Append-only JSON lines, flushed and synced per event, so the history of a run
+    survives a hard kill (no run_end event = it was killed). File names and counts only:
+    never cell values, and so never exception messages, which can quote them."""
+
+    def __init__(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.f, self.lock = path.open("a", encoding="utf-8"), threading.Lock()
+
+    def event(self, event, **fields):
+        line = json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": event, **fields},
+                          ensure_ascii=False)
+        try:
+            with self.lock:
+                self.f.write(line + "\n")
+                self.f.flush()
+                os.fsync(self.f.fileno())
+        except OSError:                      # a full disk fails the output too: don't die here
+            pass
+
+def loggable_args(a):
+    """The command line for the log: names from --domains and the column lists can
+    identify the customer, so only their number is kept."""
+    args = {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()}
+    args["files"] = [str(p) for p in a.files]
+    args["review_url"] = urlparse(a.review_url).hostname
+    for k in ("domains", "id_columns", "keep_columns"):
+        args[k] = sum(1 for x in getattr(a, k).split(",") if x.strip())
+    return args
+
+def fingerprint(text):
+    """Keyed and one-way: shows that two values differ, reveals neither them nor the key."""
+    return _h("MANIFEST", text)[:16]
+
+def run_settings(a, review_model):
+    """Everything that changes the output bytes, apart from the inputs. Values that could
+    identify the customer are stored as fingerprints. Device and worker count don't matter."""
+    return {
+        "key": fingerprint("key"),
+        "domains": fingerprint(a.domains),
+        "terms": fingerprint(a.terms.read_text(encoding="utf-8", errors="replace") if a.terms else ""),
+        "id_columns": fingerprint(a.id_columns),
+        "keep_columns": fingerprint(a.keep_columns),
+        "no_lexicon": a.no_lexicon,
+        "xlsx_full_max_mb": a.xlsx_full_max_mb,
+        "ner": None if a.no_ner else [a.model, a.threshold, a.name_threshold],
+        "review": None if not a.review else [review_model, a.review_apply, a.review_min_len],
+    }
+
+def input_stamps(jobs, outdir):
+    """{output path relative to outdir: [input size, mtime]}. The lexicon comes from all
+    inputs, so a changed input makes the finished outputs stale, not only its own."""
+    stamps = {}
+    for f, dst, _ in jobs:
+        st = f.stat()
+        stamps[dst.relative_to(outdir).as_posix()] = [st.st_size, st.st_mtime_ns]
+    return stamps
+
+class Manifest:
+    """What is finished in this outdir, and under which settings. An output only counts
+    if it is listed here, so leftovers of another run are never taken for finished work.
+    Lives next to the outdir, whose content is what gets shared, and holds file names,
+    counts and fingerprints."""
+
+    def __init__(self, path, settings, inputs, completed=None):
+        self.path, self.settings, self.inputs, self.completed = path, settings, inputs, completed or {}
+
+    @classmethod
+    def for_resume(cls, path, outdir, settings, inputs, jobs):
+        """Existing record if it matches this run, a new one if nothing was done yet.
+        Anything that would mix outputs of different runs is refused."""
+        if not path.exists():
+            if any(p.exists() for _, dst, _ in jobs for p in (dst, xlsx_out(dst))):
+                sys.exit(f"--resume: {outdir} holds outputs but no record of how they were made. "
+                         "Re-run without --resume to overwrite them, or use another --outdir.")
+            return cls(path, settings, inputs)
+        try:
+            m = json.loads(path.read_text(encoding="utf-8"))
+            old_settings, old_inputs, completed = m["settings"], m["inputs"], m["completed"]
+        except (ValueError, KeyError, TypeError) as e:
+            sys.exit(f"--resume: unreadable {path} ({type(e).__name__}). Re-run without --resume.")
+        diff = ["ANON_KEY"] if old_settings.get("key") != settings["key"] else \
+            [k for k in settings if old_settings.get(k) != settings[k]]
+        diff += [f"input {k}" for k in sorted(old_inputs.keys() | inputs.keys())
+                 if old_inputs.get(k) != inputs.get(k)]
+        if diff:
+            sys.exit(f"--resume refused, the finished outputs were made differently. Changed: "
+                     f"{', '.join(diff)}. Use the same settings and inputs, or re-run without "
+                     "--resume to start over.")
+        return cls(path, settings, inputs, completed)
+
+    def is_done(self, rel, dst):
+        return rel in self.completed and (dst.exists() or xlsx_out(dst).exists())
+
+    def save(self):
+        write_atomic(self.path, json.dumps({"settings": self.settings, "inputs": self.inputs,
+                                            "completed": self.completed}, indent=2, ensure_ascii=False))
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1657,6 +1874,12 @@ def main():
     ap.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"),
                     help="where the NER model runs; auto = CUDA GPU, else Apple GPU (MPS), else CPU")
     ap.add_argument("--map", type=Path, help="write token->original map (SENSITIVE, keep local)")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue an interrupted run: same inputs, outdir and settings; finished "
+                         "files are skipped (but still pre-scanned), anything else is refused")
+    ap.add_argument("--progress-log", type=Path,
+                    help="append-only log of the run, file names and counts only "
+                         "(default: <outdir>.progress.log next to the outdir)")
     lx = ap.add_argument_group("identity columns & lexicon")
     lx.add_argument("--terms", type=Path,
                     help="extra terms to always replace, one per line, optionally 'term,CATEGORY' "
@@ -1690,6 +1913,9 @@ def main():
                     help="records reviewed in parallel, i.e. LLM requests in flight (default: 4). "
                          "Match the server: LM Studio 'Max Concurrent Predictions', vLLM / "
                          "llama-server --parallel on a GPU box can take 16+")
+    rv.add_argument("--review-retry-minutes", type=float, default=60,
+                    help="wait this long for a review server that is down or timing out, then "
+                         f"stop with exit code {EXIT_RETRY_LATER} so --resume can continue (default: 60)")
     rv.add_argument("--allow-remote-review", action="store_true",
                     help="permit a non-localhost --review-url (private cloud endpoint only)")
     a = ap.parse_args()
@@ -1704,7 +1930,8 @@ def main():
         if p.is_dir() and (od == p.resolve() or p.resolve() in od.parents):
             sys.exit(f"--outdir {a.outdir} is inside the input folder {p} - pick a separate folder "
                      "so originals are never overwritten or re-processed")
-    jobs = collect(a.files, a.outdir, extra_skip=(a.map, a.review_report),
+    log_path = a.progress_log or od.parent / f"{od.name}.progress.log"
+    jobs = collect(a.files, a.outdir, extra_skip=(a.map, a.review_report, log_path),
                    recursive=not a.no_recursive)
     if not jobs:
         sys.exit("no supported input files found")
@@ -1716,14 +1943,43 @@ def main():
     if not a.verbose:
         quiet_ml_libs()
     a.outdir.mkdir(parents=True, exist_ok=True)
+    try:
+        plog = ProgressLog(log_path)
+    except OSError as e:
+        sys.exit(f"can't write the progress log {log_path} ({e.strerror}): choose one with --progress-log")
+    plog.event("run_start", args=loggable_args(a), files=len(jobs), pid=os.getpid())
     state = {"ui": None, "current": None, "reviewer": None, "done": 0,
              "started": time.monotonic()}
 
-    def run():
-        ner = None if a.no_ner else NER(a.model, a.threshold, a.name_threshold, a.device)  # fail fast
+    def save_map():
+        if a.map:
+            a.map.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(a.map, json.dumps(dict(MAPPING), indent=2))
+
+    def work():
         reviewer = Reviewer(a.review_url, a.review_model, a.review_apply, a.review_report,
-                            a.allow_remote_review, a.review_min_len) if a.review else None
+                            a.allow_remote_review, a.review_min_len, retry_minutes=a.review_retry_minutes,
+                            append_report=a.resume) if a.review else None   # fail fast
         state["reviewer"] = reviewer
+        if reviewer:
+            reviewer.on_event = plog.event
+        settings, inputs = run_settings(a, reviewer and reviewer.model), input_stamps(jobs, a.outdir)
+        manifest_path = od.parent / f"{od.name}.manifest.json"
+        manifest = (Manifest.for_resume(manifest_path, a.outdir, settings, inputs, jobs) if a.resume
+                    else Manifest(manifest_path, settings, inputs))
+        try:
+            manifest.save()
+        except OSError as e:
+            sys.exit(f"can't write {manifest_path} ({e.strerror}): it lives next to --outdir")
+        for _, dst, _ in jobs:                        # left by a hard kill
+            remove_partial(part_path(dst))
+        if a.resume:
+            log(f"resuming: {len(manifest.completed)} of {len(jobs)} file(s) already done")
+            if a.map and a.map.exists():              # tokens of the finished files
+                MAPPING.update(json.loads(a.map.read_text(encoding="utf-8")))
+            elif a.map and manifest.completed:
+                log(f"{a.map} not found: the map will miss the tokens of the finished files", style="yellow")
+        ner = None if a.no_ner else NER(a.model, a.threshold, a.name_threshold, a.device)  # fail fast
         if any(p.is_dir() for p in a.files):
             log(f"{len(jobs)} file(s) found")
         lexicon = Lexicon()
@@ -1754,29 +2010,79 @@ def main():
             with UI(len(jobs), ner, reviewer, enabled=not a.no_progress) as ui:
                 state["ui"] = ui
                 for f, dst, label in jobs:
+                    rel = dst.relative_to(a.outdir).as_posix()
+                    if a.resume and manifest.is_done(rel, dst):
+                        ui.skip(label, "already done")
+                        plog.event("file_skip", file=label, why="already done")
+                        continue
+                    t0 = time.monotonic()
+                    plog.event("file_start", file=label)
                     try:
                         if dst.resolve() == f.resolve():
                             raise ValueError("output would overwrite the input")
-                        state["current"] = dst
-                        process_file(f, dst, anon, ui, a.xlsx_full_max_mb, label)
+                        state["current"] = part_path(dst)
+                        written = process_file(f, dst, anon, ui, a.xlsx_full_max_mb, label)
                         state["current"] = None
+                        if not written:
+                            plog.event("file_skip", file=label, why="unsupported type")
+                            continue
                         state["done"] += 1
+                        # in this order: a crash in between only means this file is done again
+                        save_map()
+                        manifest.completed[rel] = {"records": ui.count, "unit": ui.unit,
+                                                   "seconds": round(time.monotonic() - t0, 1)}
+                        manifest.save()
+                        plog.event("file_finish", file=label, **manifest.completed[rel])
+                    except ReviewError as e:           # no point in trying the other files
+                        state["current"] = None
+                        remove_partial(dst)            # an older run's output is not this run's
+                        ui.fail(label, "stopped, partial output removed")
+                        plog.event("file_fail", file=label, error=type(e).__name__,
+                                   seconds=round(time.monotonic() - t0, 1))
+                        raise
                     except Exception as e:
                         state["current"] = None
-                        remove_partial(dst)            # streamed output stops where the error was
+                        remove_partial(dst)            # an older run's output is not this run's
+                        plog.event("file_fail", file=label, error=type(e).__name__,
+                                   seconds=round(time.monotonic() - t0, 1))
                         if a.verbose:
                             raise
                         ui.fail(label, f"{type(e).__name__}: {e}"[:200])
         finally:
             if reviewer:
                 reviewer.close()
+            save_map()
         if a.map:
-            a.map.parent.mkdir(parents=True, exist_ok=True); a.map.write_text(json.dumps(MAPPING, indent=2), encoding="utf-8")
             log(f"mapping written to {a.map} - treat it like the raw data", style="yellow")
-        log(f"{ui.n_ok} file(s) anonymized, {ui.n_fail} failed -> {a.outdir}/  "
+        skipped = f"{ui.n_skip} skipped, " if ui.n_skip else ""
+        log(f"{ui.n_ok} file(s) anonymized, {skipped}{ui.n_fail} failed -> {a.outdir}/  "
             f"({time.monotonic() - state['started']:.1f}s)",
             style="bold green" if not ui.n_fail else "bold red")
-        return 1 if ui.n_fail else 0
+        code = 1 if ui.n_fail else 0
+        plog.event("run_end", reason="completed" if not code else "completed with failed files",
+                   exit_code=code, ok=ui.n_ok, skipped=ui.n_skip, failed=ui.n_fail,
+                   seconds=round(time.monotonic() - state["started"], 1))
+        return code
+
+    def run():
+        """Whatever ends the run is logged. Only fixed reasons: messages can quote data."""
+        end = lambda reason, code: plog.event(
+            "run_end", reason=reason, exit_code=code, ok=state["done"],
+            seconds=round(time.monotonic() - state["started"], 1))
+        try:
+            return work()
+        except ReviewError as e:
+            retry = e.exit_code == EXIT_RETRY_LATER
+            log(f"{e} {state['done']} file(s) completed in {a.outdir}/"
+                + (". Fix the server and re-run with --resume to continue." if retry else "."), style="bold red")
+            end("review server unavailable" if retry else "review server refused a request", e.exit_code)
+            return e.exit_code
+        except SystemExit as e:
+            end("stopped", e.code if isinstance(e.code, int) else 1)
+            raise
+        except BaseException as e:
+            end(f"error: {type(e).__name__}", 1)
+            raise
 
     def on_cancel():
         ui = state["ui"]
@@ -1797,9 +2103,11 @@ def main():
                 pass
         if a.map and MAPPING:
             try:
-                a.map.parent.mkdir(parents=True, exist_ok=True); a.map.write_text(json.dumps(dict(MAPPING), indent=2), encoding="utf-8")
+                save_map()
             except Exception:
                 pass
+        plog.event("run_end", reason="cancelled", exit_code=130, ok=state["done"],
+                   seconds=round(time.monotonic() - state["started"], 1))
         log(f"cancelled - {state['done']} file(s) completed in {a.outdir}/"
             f"{', partial output of the current file removed' if cur is not None else ''}"
             f" ({time.monotonic() - state['started']:.1f}s)", style="bold yellow")
