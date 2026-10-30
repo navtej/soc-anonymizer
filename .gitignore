@@ -1,5 +1,5 @@
 # Keep real data and anything derived from it out of git.
-# Data lives outside this repo (~/work/SoC); these are a safety net.
+# Data lives outside this repo; these are a safety net.
 *.csv
 *.tsv
 *.tab
@@ -12,20 +12,39 @@
 *.json
 *.log
 *.gz
-!.claude/settings.json
 !tests/**/*.py
 
-# outputs, mappings, reviewer reports
+# secrets, outputs, mappings, reviewer reports
+annon_key.txt
+*key*.txt
+.env
+.env.*
+review.jsonl
+terms.txt
+terms*.txt
 anonymized/
 samples/
 out/
+.private/
 mapping*.json
 review_report*.jsonl
-terms*.txt
+sample_manifest.json
 
 # python / tooling
 __pycache__/
+*.py[cod]
 .pytest_cache/
 .venv/
-.claude/settings.local.json
-terms.txt
+venv/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# editors / OS / agents
+.claude/
+.DS_Store
+.idea/
+.vscode/
+*.swp
