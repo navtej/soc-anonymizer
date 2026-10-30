@@ -17,6 +17,8 @@ they can be shared with LLMs, vendors or colleagues without leaking customer dat
   a local OpenAI-compatible server (LM Studio, vLLM). Remote endpoints are refused unless you
   explicitly allow them.
 - **Streams, never loads whole files**: multi-GB CSV, NDJSON, JSON and XLSX work in flat memory.
+- **Survives interruptions**: an output only appears once complete, `--resume` continues a killed
+  run, and a review server outage is waited out instead of ending the run.
 
 Two scripts:
 
@@ -181,8 +183,9 @@ the output folder is always finished, even after a hard kill. To continue, run t
 `--resume`:
 
 ```bash
-uv run soc_anonymize.py ~/soc/in -o ~/soc/out --map ~/soc/.private/mapping.json \
-  --review --review-apply --review-report ~/soc/.private/review_report.jsonl --resume
+uv run soc_anonymize.py exports/ -o anonymized/ --domains corp.local,acme.internal \
+    --map ~/soc/.private/mapping.json \
+    --review --review-apply --review-report ~/soc/.private/review_report.jsonl --resume
 ```
 
 - Pass **all** the original inputs. Finished files are skipped but still pre-scanned, because names
@@ -269,7 +272,9 @@ ssh root@<host> bash soc-anonymizer/setup_ubuntu_gpu.sh   # first run: driver, r
 It prints the full anonymizer command at the end (`--device cuda --review --review-workers 16`).
 Use the same `ANON_KEY` as locally so tokens match. Override the model with
 `MODEL=... bash setup_ubuntu_gpu.sh`. Raw exports and the map sit on the instance's disk, and GPU
-instances are billed until **deleted** – copy back `out/` and delete the instance.
+instances are billed until **deleted** – copy back `out/` and delete the instance. If the vLLM
+server restarts for longer than `--review-retry-minutes`, restart it and re-run with `--resume`;
+`/root/soc/out.progress.log` shows how far the run got.
 
 ## Tests
 
