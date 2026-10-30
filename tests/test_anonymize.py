@@ -671,3 +671,350 @@ def test_ner_device_selection(monkeypatch):
     fake_torch.cuda.is_available = lambda: False
     fake_torch.backends.mps.is_available = lambda: False
     assert sa.pick_device("auto") == "cpu"
+
+
+# --------------------------------------------------------------------------- resume, progress log, outages
+
+RESUME_ROWS = {
+    # the name is an identity column only in a.csv; the others mention it only in prose
+    "a.csv": (["Assignee", "Summary"], [["Priya Sharma", "Reviewed the Zorblax alert today"]]),
+    "b.csv": (["Summary"], [["Escalated to Priya Sharma today"], ["Second Zorblax note for the team"]]),
+    "c.csv": (["Summary"], [["Host check done by Priya Sharma"]]),
+}
+
+
+def resume_inputs(folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, (header, rows) in RESUME_ROWS.items():
+        fixtures.write_csv(folder / name, header, rows)
+    return folder
+
+
+def read_log(path):
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
+
+
+def forget(manifest, *names):
+    """State after an interruption: these files never finished."""
+    m = json.loads(manifest.read_text())
+    for n in names:
+        del m["completed"][n]
+    manifest.write_text(json.dumps(m))
+
+
+def test_resume_skips_finished_keeps_lexicon_and_bytes(tmp_path):
+    resume_inputs(tmp_path / "in")
+    run(["in", "-o", "full", "--no-ner", "--map", "full.json"], tmp_path)
+    run(["in", "-o", "out", "--no-ner", "--map", "out.json"], tmp_path)
+    forget(tmp_path / "out.manifest.json", "b.csv", "c.csv")
+    (tmp_path / "out" / "a.csv").write_bytes(b"DONE-MARKER\n")
+    (tmp_path / "out" / "b.csv").unlink()
+    (tmp_path / "out" / "c.csv").unlink()
+    (tmp_path / "out" / ".part-c.csv").write_bytes(b"truncated by a hard kill")
+    r = run(["in", "-o", "out", "--no-ner", "--map", "out.json", "--resume"], tmp_path)
+    assert "already done" in r.stdout + r.stderr
+    assert (tmp_path / "out" / "a.csv").read_bytes() == b"DONE-MARKER\n", "finished file was redone"
+    assert b"Priya" not in (tmp_path / "out" / "b.csv").read_bytes(), "name from the skipped file got through"
+    for name in ("b.csv", "c.csv"):
+        assert (tmp_path / "out" / name).read_bytes() == (tmp_path / "full" / name).read_bytes()
+    assert not (tmp_path / "out" / ".part-c.csv").exists()
+    assert json.load(open(tmp_path / "out.json")) == json.load(open(tmp_path / "full.json"))
+    # a second resume has nothing left to do, and outputs that vanished are done again
+    (tmp_path / "out" / "c.csv").unlink()
+    r = run(["in", "-o", "out", "--no-ner", "--resume"], tmp_path)
+    assert "1 file(s) anonymized, 2 skipped" in r.stdout + r.stderr
+    assert (tmp_path / "out" / "c.csv").read_bytes() == (tmp_path / "full" / "c.csv").read_bytes()
+
+
+def test_resume_refuses_to_mix_runs(tmp_path):
+    resume_inputs(tmp_path / "in")
+    base = ["in", "-o", "out", "--no-ner"]
+    run(base, tmp_path)
+    before = (tmp_path / "out" / "a.csv").read_bytes()
+
+    def refused(args, env=ENV):
+        r = subprocess.run([sys.executable, str(SCRIPT), *args, "--resume", "--no-progress"],
+                           cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300)
+        assert r.returncode != 0
+        return r.stdout + r.stderr
+
+    assert "ANON_KEY" in refused(base, dict(ENV, ANON_KEY="another-key"))
+    assert "domains" in refused(base + ["--domains", "corp.local"])
+    assert "no_lexicon" in refused(base + ["--no-lexicon"])
+    fixtures.write_csv(tmp_path / "in" / "c.csv", ["Summary"], [["A longer, different export of this file"]])
+    assert "input c.csv" in refused(base)
+    (tmp_path / "in" / "c.csv").unlink()
+    assert "input c.csv" in refused(base)
+    resume_inputs(tmp_path / "in")
+    (tmp_path / "out.manifest.json").unlink()
+    assert "no record" in refused(base)
+    assert (tmp_path / "out" / "a.csv").read_bytes() == before
+    # nothing done yet: --resume is simply a first run, so retry loops can always pass it
+    run(["in", "-o", "fresh", "--no-ner", "--resume"], tmp_path)
+    assert (tmp_path / "fresh" / "a.csv").exists()
+
+
+def test_fresh_run_does_not_inherit_finished_state(tmp_path):
+    resume_inputs(tmp_path / "in")
+    run(["in", "-o", "out", "--no-ner"], tmp_path)
+    run(["in", "-o", "out", "--no-ner"], tmp_path)
+    assert set(json.load(open(tmp_path / "out.manifest.json"))["completed"]) == set(RESUME_ROWS)
+    # an interrupted second run must not vouch for the first run's outputs
+    m = json.load(open(tmp_path / "out.manifest.json"))
+    m["completed"] = {}
+    (tmp_path / "out.manifest.json").write_text(json.dumps(m))
+    r = run(["in", "-o", "out", "--no-ner", "--resume"], tmp_path)
+    assert "3 file(s) anonymized" in r.stdout + r.stderr
+
+
+def test_failed_file_keeps_no_partial_and_output_only_when_complete(tmp_path):
+    sa = load_module()
+    src = tmp_path / "rows.csv"
+    fixtures.write_csv(src, ["Summary"], [["one note here"], ["second note here"]])
+    dst = tmp_path / "out" / "rows.csv"
+
+    class Boom(sa.Anonymizer):
+        def scrub_str(self, *a, **k):
+            assert not dst.exists(), "final name in use before the file is complete"
+            assert sa.part_path(dst).exists()
+            raise ValueError("boom")
+
+    with sa.UI(1, enabled=False) as ui:
+        with pytest.raises(ValueError):
+            sa.process_file(src, dst, Boom(sa.build_rules([])), ui)
+    assert not dst.exists() and not sa.part_path(dst).exists()
+
+
+def test_xlsm_outputs_are_committed_under_the_right_name(tmp_path):
+    import openpyxl
+    (tmp_path / "in").mkdir()
+    wb = openpyxl.Workbook()
+    wb.active.append(["Assignee", "Note"])
+    wb.active.append(["Priya Sharma", "x"])
+    wb.save(tmp_path / "in" / "book.xlsm")
+    run(["in", "-o", "full", "--no-ner"], tmp_path)
+    assert [p.name for p in (tmp_path / "full").iterdir()] == ["book.xlsm"]
+    run(["in", "-o", "streamed", "--no-ner", "--xlsx-full-max-mb", "0"], tmp_path)
+    assert [p.name for p in (tmp_path / "streamed").iterdir()] == ["book.xlsx"]
+    r = run(["in", "-o", "streamed", "--no-ner", "--xlsx-full-max-mb", "0", "--resume"], tmp_path)
+    assert "already done" in r.stdout + r.stderr
+
+
+def test_progress_log_records_the_run_without_values(tmp_path):
+    resume_inputs(tmp_path / "in")
+    (tmp_path / "in" / "old.xls").write_bytes(b"x")
+    (tmp_path / "in" / "bad.json").write_text('{"value": [{"Summary": "SECRETVALUE"}')
+    r = run(["in", "-o", "out", "--no-ner", "--domains", "acme.internal,corp.local",
+             "--id-columns", "Hidden Header=USER"], tmp_path, check=False)
+    assert r.returncode == 1            # bad.json
+    text = (tmp_path / "out.progress.log").read_text()
+    for secret in ("Priya", "SECRETVALUE", "acme.internal", "Hidden Header", "test-key"):
+        assert secret not in text
+    events = read_log(tmp_path / "out.progress.log")
+    assert events[0]["event"] == "run_start" and events[0]["args"]["domains"] == 2
+    assert events[-1]["event"] == "run_end" and events[-1]["exit_code"] == 1
+    finished = {e["file"]: e for e in events if e["event"] == "file_finish"}
+    assert finished["b.csv"]["records"] == 2 and finished["b.csv"]["seconds"] >= 0
+    assert [e["file"] for e in events if e["event"] == "file_fail"] == ["bad.json"]
+    assert [e["file"] for e in events if e["event"] == "file_skip"] == ["old.xls"]
+    # appended, also to a chosen path; that path is never taken for an input
+    run(["in/a.csv", "-o", "out", "--no-ner"], tmp_path)
+    assert len(read_log(tmp_path / "out.progress.log")) > len(events)
+    manifest = (tmp_path / "out.manifest.json").read_text()
+    for secret in ("Priya", "acme.internal", "test-key"):
+        assert secret not in manifest
+    run(["in/a.csv", "-o", "o2", "--no-ner", "--progress-log", "logs/run.log"], tmp_path)
+    assert read_log(tmp_path / "logs" / "run.log")[0]["event"] == "run_start"
+    assert not (tmp_path / "o2.progress.log").exists()
+
+
+# A review server the test controls: flags 'Zorblax', goes away after DOWN_AFTER requests.
+STUB_REVIEW = r'''
+import importlib.util, json, os, sys, threading, urllib.error
+spec = importlib.util.spec_from_file_location("sa", sys.argv[1]); sa = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sa)
+sa.RETRY_WAIT = (0.01, 0.01)
+calls, lock = [0], threading.Lock()
+class Reply:
+    def __init__(self, content): self.body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+    def read(self): return self.body
+def urlopen(req, timeout=None):
+    with lock:
+        calls[0] += 1
+        n = calls[0]
+    if n > int(os.environ.get("DOWN_AFTER", 10**9)):
+        raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+    text = json.loads(req.data)["messages"][1]["content"]
+    return Reply(json.dumps({"leaks": [{"text": "Zorblax", "type": "PROJECT"}] if "Zorblax" in text else []}))
+sa.urllib.request.urlopen = urlopen
+if os.environ.get("NO_CLOSE"):
+    sa.close_write_only = lambda wb: None
+sys.argv = ["soc_anonymize.py"] + sys.argv[2:]
+sa.main()
+'''
+
+
+def review_run(tmp_path, args, down_after=None, **env):
+    e = dict(ENV, **env)
+    if down_after is not None:
+        e["DOWN_AFTER"] = str(down_after)
+    (tmp_path / "stub_review.py").write_text(STUB_REVIEW)
+    return subprocess.run([sys.executable, "stub_review.py", str(SCRIPT), *map(str, args),
+                           "--no-ner", "--no-progress", "--review", "--review-apply", "--review-model", "m",
+                           "--review-retry-minutes", "0.002"],
+                          cwd=tmp_path, env=e, capture_output=True, text=True, timeout=300)
+
+
+@pytest.mark.parametrize("workers", ["1", "4"])
+def test_review_outage_stops_cleanly_and_resume_continues(tmp_path, workers):
+    resume_inputs(tmp_path / "in")
+    extra = ["--review-workers", workers, "--map", "map.json"]
+    full = review_run(tmp_path, ["in", "-o", "full", "--review-report", "full.jsonl", *extra])
+    assert full.returncode == 0, full.stdout + full.stderr
+    full_map = json.load(open(tmp_path / "map.json"))
+
+    # a.csv needs 1 request (the identity column is short), b.csv dies on its second
+    args = ["in", "-o", "out", "--review-report", "out.jsonl", *extra]
+    r = review_run(tmp_path, args, down_after=2)
+    assert r.returncode == 75, r.stdout + r.stderr
+    assert "--resume" in r.stderr and "Traceback" not in r.stderr
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["a.csv"], "partial output left behind"
+    events = read_log(tmp_path / "out.progress.log")
+    assert events[-1]["event"] == "run_end" and events[-1]["reason"] == "review server unavailable"
+    assert events[-1]["exit_code"] == 75
+    assert {"event": "file_fail", "file": "b.csv"}.items() <= [e for e in events if e["event"] == "file_fail"][0].items()
+    assert any(e["event"] == "review_outage" for e in events)
+    flagged_before = (tmp_path / "out.jsonl").read_text()
+    assert "a.csv" in flagged_before
+
+    r = review_run(tmp_path, [*args, "--resume"])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "already done" in r.stderr
+    assert (tmp_path / "out.jsonl").read_text().startswith(flagged_before), "--resume wiped the report"
+    for name in RESUME_ROWS:
+        assert (tmp_path / "out" / name).read_bytes() == (tmp_path / "full" / name).read_bytes()
+    assert json.load(open(tmp_path / "map.json")) == full_map
+
+
+def test_streamed_xlsx_abort_closes_cleanly(tmp_path):
+    import openpyxl
+    wb = openpyxl.Workbook()
+    wb.active.append(["Summary"])
+    for i in range(20):
+        wb.active.append([f"Long enough note number {i} for the reviewer"])
+    wb.create_sheet("Second").append(["Summary"])
+    wb.save(tmp_path / "book.xlsx")
+    args = ["book.xlsx", "-o", "out", "--xlsx-full-max-mb", "0", "--review-report", "r.jsonl"]
+    r = review_run(tmp_path, args, down_after=5)
+    assert r.returncode == 75, r.stdout + r.stderr
+    assert "Exception ignored" not in r.stderr and "closed file" not in r.stderr, r.stderr
+    assert list((tmp_path / "out").iterdir()) == []
+    # the guard above sees the noise when the book is left to the garbage collector
+    r = review_run(tmp_path, args, down_after=5, NO_CLOSE="1")
+    assert r.returncode == 75 and "closed file" in r.stderr, r.stderr
+
+
+def _reviewer(sa, monkeypatch, replies, minutes=1):
+    """Each reply is raised, or returned as the response body."""
+    sa.RETRY_WAIT = (0, 0)
+    rv = sa.Reviewer("http://127.0.0.1:1/v1", model="m", retry_minutes=minutes)
+    seen = []
+
+    def urlopen(req, timeout=None):
+        seen.append(req.full_url)
+        reply = replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+
+        class R:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return reply
+        return R()
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    return rv, seen
+
+
+def _http_error(sa, code):
+    return sa.urllib.error.HTTPError("http://x", code, "err", {}, None)
+
+
+def test_review_retries_connection_errors_and_timeouts(monkeypatch):
+    sa = load_module()
+    import http.client
+    refused = sa.urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+    rv, seen = _reviewer(sa, monkeypatch, [refused, TimeoutError(), ConnectionResetError(), _http_error(sa, 503),
+                                           http.client.IncompleteRead(b""), b"<html>starting", b'{"ok": 1}'])
+    assert rv._http("/x") == {"ok": 1} and len(seen) == 7
+    assert rv.down_since is None
+
+
+@pytest.mark.parametrize("code", [400, 401, 404])
+def test_review_4xx_is_not_retried(monkeypatch, code):
+    sa = load_module()
+    rv, seen = _reviewer(sa, monkeypatch, [_http_error(sa, code), b"{}"])
+    with pytest.raises(sa.ReviewError) as e:
+        rv._http("/x")
+    assert len(seen) == 1 and e.value.exit_code == 1
+
+
+def test_review_retries_are_bounded(monkeypatch):
+    sa = load_module()
+    refused = sa.urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+    rv, seen = _reviewer(sa, monkeypatch, [refused] * 10_000, minutes=0.001)
+    sa.RETRY_WAIT = (0.01, 0.01)
+    with pytest.raises(sa.ReviewError) as e:
+        rv._http("/x")
+    assert e.value.exit_code == sa.EXIT_RETRY_LATER and 1 <= len(seen) < 10_000
+    assert rv.gave_up.is_set()
+    n = len(seen)                       # the other workers stop at their next failure
+    with pytest.raises(sa.ReviewError):
+        rv._http("/x")
+    assert len(seen) == n + 1
+
+
+def test_review_startup_probe_fails_fast(monkeypatch):
+    sa = load_module()
+    calls = []
+
+    def urlopen(req, timeout=None):
+        calls.append(1)
+        raise sa.urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    with pytest.raises(sa.ReviewError):
+        sa.Reviewer("http://127.0.0.1:1/v1")
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGKILL semantics")
+def test_hard_kill_leaves_no_output_under_the_final_name(tmp_path):
+    fixtures.write_csv(tmp_path / "rows.csv", ["Assignee", "Description"],
+                       [[f"user{i}", f"Long description text number {i} about an incident"] for i in range(5)])
+    stub = STUB_NER.replace(
+        "class StubModel:",
+        "import hashlib, os\nclass StubModel:").replace(
+        "        found = [",
+        "        if os.environ.get('SLOW'): hashlib.pbkdf2_hmac('sha256', b'x', b'y', 30_000_000)\n"
+        "        found = [")
+    (tmp_path / "stub.py").write_text(stub)
+    cmd = [sys.executable, "stub.py", str(SCRIPT), "rows.csv", "-o", "out", "--no-progress", "--resume"]
+    p = subprocess.Popen(cmd, cwd=tmp_path, env=dict(ENV, SLOW="1"),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_file = tmp_path / "out.progress.log"
+    deadline = time.monotonic() + 60
+    while "file_start" not in (log_file.read_text() if log_file.exists() else ""):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    p.kill()
+    p.wait()
+    assert not (tmp_path / "out" / "rows.csv").exists()
+    assert read_log(log_file)[-1]["event"] == "file_start", "a hard kill writes no run_end"
+    r = subprocess.run(cmd, cwd=tmp_path, env=ENV, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / "out" / "rows.csv").exists()
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["rows.csv"]
+    assert read_log(log_file)[-1]["event"] == "run_end"

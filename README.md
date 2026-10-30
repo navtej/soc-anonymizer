@@ -17,6 +17,8 @@ they can be shared with LLMs, vendors or colleagues without leaking customer dat
   a local OpenAI-compatible server (LM Studio, vLLM). Remote endpoints are refused unless you
   explicitly allow them.
 - **Streams, never loads whole files**: multi-GB CSV, NDJSON, JSON and XLSX work in flat memory.
+- **Survives interruptions**: an output only appears once complete, `--resume` continues a killed
+  run, and a review server outage is waited out instead of ending the run.
 
 Two scripts:
 
@@ -174,6 +176,35 @@ fix misses with `--id-columns`, `--keep-columns` or `--terms`. Non-identity colu
 severity, dates, scores, tactics, alert titles) pass through unchanged; bare numbers in prose
 (ports, counts, event IDs) are kept.
 
+### Interrupted runs
+
+Outputs appear under their final name only when complete (`.part-<name>` until then), so what is in
+the output folder is always finished, even after a hard kill. To continue, run the same command with
+`--resume`:
+
+```bash
+uv run soc_anonymize.py exports/ -o anonymized/ --domains corp.local,acme.internal \
+    --map ~/soc/.private/mapping.json \
+    --review --review-apply --review-report ~/soc/.private/review_report.jsonl --resume
+```
+
+- Pass **all** the original inputs. Finished files are skipped but still pre-scanned, because names
+  known only from them must still be replaced in the remaining files. The result is byte-identical to
+  an uninterrupted run (given a deterministic reviewer).
+- `--resume` is refused if the key, a setting that changes the output, or any input differs from the
+  earlier run, so outputs of different runs never mix. Without `--resume` everything is redone.
+- `--map` is merged and `--review-report` is appended to. Spans of a file that was redone can appear
+  twice in the report.
+- If the review server goes down or times out, the run waits and retries for `--review-retry-minutes`.
+  After that it removes the partial file and exits with code 75: fix the server and `--resume`. An
+  HTTP 4xx is not retried (exit code 1).
+
+Two files sit next to the output folder, not in it, so they aren't shared with the outputs:
+`<outdir>.progress.log`, an append-only JSON-lines history of the run (arguments, file start, finish
+with records and seconds, failures, exit reason; no `run_end` means it was killed), and
+`<outdir>.manifest.json`, the record `--resume` reads. Both hold file names and counts only, never
+cell values; the key and values like `--domains` appear only as keyed fingerprints or counts.
+
 ### Arguments
 
 | Argument | Default | Description |
@@ -182,6 +213,8 @@ severity, dates, scores, tactics, alert titles) pass through unchanged; bare num
 | `-o`, `--outdir` | `./anonymized` | Output folder (must not be inside an input folder) |
 | `--domains` | – | Internal DNS suffixes, comma-separated (`corp.local,acme.internal`); host names under them are tokenized |
 | `--map` | – | Write the token → original map (**sensitive**, keep private) |
+| `--resume` | off | Continue an interrupted run: same inputs, output folder and settings (see above) |
+| `--progress-log` | `<outdir>.progress.log` | Append-only log of the run: file names and counts only |
 | `--no-ner` | off | Rules and lexicon only: fast, no model |
 | `--model` | `fastino/gliner2-privacy-filter-PII-multi` | Hugging Face id or local directory of the GLiNER2 PII model |
 | `--prefetch` | – | Download the NER model into the local cache and exit |
@@ -213,6 +246,7 @@ severity, dates, scores, tactics, alert titles) pass through unchanged; bare num
 | `--review-report` | `review_report.jsonl` | JSONL of flagged spans (**sensitive**: contains the leaked values) |
 | `--review-min-len` | `20` | Only review strings at least this long |
 | `--review-workers` | `4` | Records reviewed in parallel (LLM requests in flight); match the server's concurrency |
+| `--review-retry-minutes` | `60` | Wait this long for a review server that is down or timing out, then stop with exit code 75 |
 | `--allow-remote-review` | off | Permit a non-localhost `--review-url` (private endpoint only) |
 
 ### Limitations
@@ -238,7 +272,9 @@ ssh root@<host> bash soc-anonymizer/setup_ubuntu_gpu.sh   # first run: driver, r
 It prints the full anonymizer command at the end (`--device cuda --review --review-workers 16`).
 Use the same `ANON_KEY` as locally so tokens match. Override the model with
 `MODEL=... bash setup_ubuntu_gpu.sh`. Raw exports and the map sit on the instance's disk, and GPU
-instances are billed until **deleted** – copy back `out/` and delete the instance.
+instances are billed until **deleted** – copy back `out/` and delete the instance. If the vLLM
+server restarts for longer than `--review-retry-minutes`, restart it and re-run with `--resume`;
+`/root/soc/out.progress.log` shows how far the run got.
 
 ## Tests
 
