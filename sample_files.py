@@ -469,6 +469,44 @@ def xlsx_stream(path):
     finally:
         book.close()
 
+_XL_ROW = re.compile(rb"<(?:\w+:)?row\b[^>]*?(?:/>|>(.*?)</(?:\w+:)?row>)", re.S)
+_XL_VALUE = re.compile(rb"<(?:\w+:)?[vt](?:\s[^>]*)?>[^<]")     # <v>x, <t>x, <t xml:space=..>x
+
+def xlsx_count_rows(path, progress=None, chunk=16 << 20):
+    """{worksheet title: non-empty rows}, counted by scanning the sheet XML for rows
+    with a non-empty <v>/<t>: no shared strings, no cell objects, so a multi-GB
+    book is counted at unzip speed instead of a full (slow) read. A shared string
+    that is itself empty still counts - not written by Excel, harmless if it is.
+    progress(done, total) gets uncompressed bytes."""
+    import posixpath, zipfile
+    import xml.etree.ElementTree as ET
+    ns_r = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    with zipfile.ZipFile(path) as z:
+        rels = {r.get("Id"): r for r in ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))}
+        sheets = []
+        for s in ET.fromstring(z.read("xl/workbook.xml")).iter():
+            if s.tag.rsplit("}", 1)[-1] == "sheet" and (rel := rels.get(s.get(ns_r))) is not None \
+                    and rel.get("Type", "").endswith("/worksheet"):
+                t = rel.get("Target")
+                sheets.append((s.get("name"), t.lstrip("/") if t.startswith("/")
+                               else posixpath.normpath(posixpath.join("xl", t))))
+        total, done, counts = sum(z.getinfo(p).file_size for _, p in sheets), 0, {}
+        for title, p in sheets:
+            n, buf = 0, b""
+            with z.open(p) as f:
+                while data := f.read(chunk):
+                    buf += data
+                    end = 0
+                    for m in _XL_ROW.finditer(buf):
+                        n += bool(m.group(1) and _XL_VALUE.search(m.group(1)))
+                        end = m.end()
+                    buf = buf[end:]                    # a row cut off by the chunk waits for the next
+                    done += len(data)
+                    if progress:
+                        progress(done, total)
+            counts[title] = n
+    return counts
+
 def sample_xlsx(src, dst, sampler, key, ui, full_max_mb):
     """Full-fidelity copy only for books whose sheet data is small enough to load
     quickly; everything else is streamed."""
@@ -488,17 +526,18 @@ def sample_xlsx_fast(src, dst, sampler, key, ui, size_mb):
     from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font
     bold = Font(bold=True)
-    plans, total = [], 0
-    with CONSOLE.status(f"counting rows in {src.name} ({size_mb:,.0f} MB of sheet data) ...",
-                        spinner="dots") as st:
-        for title, _hidden, rows in xlsx_stream(src):
-            st.update(f"counting rows in {src.name} ({size_mb:,.0f} MB of sheet data) › sheet '{title}' ...")
-            n = max(sum(1 for _ in rows) - 1, 0)        # minus header
-            plans.append(set(sampler.pick(n, f"{key}#{title}")))
-            total += n
+    msg = f"counting rows in {src.name} ({size_mb:,.0f} MB of sheet data)"
+    with CONSOLE.status(f"{msg} ...", spinner="dots") as st:
+        try:
+            counts = xlsx_count_rows(src, lambda d, t: st.update(f"{msg} {100 * d / max(t, 1):.0f}% ..."))
+        except Exception:                              # unusual package layout: count by reading
+            counts = {title: sum(1 for _ in rows) for title, _h, rows in xlsx_stream(src)}
+    plans = {t: set(sampler.pick(max(n - 1, 0), f"{key}#{t}")) for t, n in counts.items()}  # minus header
+    total = sum(max(n - 1, 0) for n in counts.values())
     ui.start(src.name, total, "rows")
     out, kept = Workbook(write_only=True), 0
-    for keep, (title, hidden, rows) in zip(plans, xlsx_stream(src)):
+    for title, hidden, rows in xlsx_stream(src):
+        keep = plans.get(title, set())
         nws = out.create_sheet(title)
         if hidden:                                     # hidden / veryHidden
             nws.sheet_state = "hidden"
@@ -510,9 +549,8 @@ def sample_xlsx_fast(src, dst, sampler, key, ui, size_mb):
             nws.append(cells)
         for i, row in enumerate(rows):
             if i in keep:
-                nws.append(row)
+                nws.append(row); kept += 1
             ui.advance()
-        kept += len(keep)
     out.save(_xlsx_dst(src, dst))
     note = f"{len(plans)} sheet(s), {size_mb:,.0f} MB streamed: values only"
     if src.suffix.lower() == ".xlsm":

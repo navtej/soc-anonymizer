@@ -61,8 +61,9 @@ say "NVIDIA driver"
 if ! nvidia-smi >/dev/null 2>&1; then
     lspci | grep -qi nvidia || die "no NVIDIA GPU found – is this a GPU instance?"
     ubuntu-drivers install --gpgpu || ubuntu-drivers install
-    # the -server (gpgpu) driver needs the matching utils for nvidia-smi
-    drv=$(dpkg -l 'nvidia-driver-*' 2>/dev/null | awk '/^ii/{print $2}' | grep -o '[0-9]\+' | head -1 || true)
+    # the -server (gpgpu) driver needs the matching utils for nvidia-smi; --gpgpu installs
+    # nvidia-headless-no-dkms-<ver>-server-open, not nvidia-driver-<ver>
+    drv=$(dpkg -l 'nvidia-driver-*' 'nvidia-headless-no-dkms-*' 2>/dev/null | awk '/^ii/{print $2}' | grep -o '[0-9]\+' | head -1 || true)
     [[ -n "$drv" ]] && apt-get install -yq "nvidia-utils-${drv}-server" 2>/dev/null || true
     say "driver installed – reboot, then run this script again:  reboot"
     exit 0
@@ -112,6 +113,8 @@ WorkingDirectory=$APP_DIR
 Environment=HF_HUB_OFFLINE=1
 Environment=VLLM_NO_USAGE_STATS=1
 Environment=DO_NOT_TRACK=1
+# FlashInfer's sampler is JIT-compiled with nvcc, and the driver alone ships no CUDA toolkit
+Environment=VLLM_USE_FLASHINFER_SAMPLER=0
 ExecStart=$VLLM serve $MODEL --host 127.0.0.1 --port $PORT --api-key $API_KEY \\
     --served-model-name $SERVED_NAME --max-model-len $MAX_LEN \\
     --gpu-memory-utilization $GPU_UTIL --tensor-parallel-size $TP$EXTRA

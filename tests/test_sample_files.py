@@ -131,3 +131,20 @@ def test_xlsx_stream_readers_agree(tmp_path):
     wb = load_workbook(tmp_path / "out" / "offset.xlsx")
     assert wb.sheetnames == ["Offset", "Hidden"] and wb["Hidden"].sheet_state == "hidden"
     assert [c.value for c in wb["Offset"][4]][2] == "after the gap"
+
+
+def test_xlsx_row_count_scan_matches_reader(tmp_path):
+    """The XML scan used to count rows of large books gives the same non-empty row
+    counts as reading them, also when rows straddle read chunks."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("sample_files", SCRIPT)
+    sf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sf)
+    fixtures.build_sampling_set(tmp_path / "a")
+    books = [tmp_path / "a" / "book.xlsx", fixtures.build_offset_xlsx(tmp_path / "b")]
+    fixtures.build_control_chars_xlsx(tmp_path / "c")
+    books += sorted((tmp_path / "c").glob("*.xlsx"))
+    for book in books:
+        want = {t: sum(1 for _ in rows) for t, _h, rows in sf.xlsx_stream(book)}
+        assert sf.xlsx_count_rows(book) == want, book.name
+        assert sf.xlsx_count_rows(book, chunk=7) == want, book.name

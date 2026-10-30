@@ -140,7 +140,10 @@ Exact `ceil(N·p%)` random records per file/sheet (`-p`, default 10), `--seed` f
 (per-file RNG from seed + path), `--min-rows/--max-rows`, folders recursive, `.gz` input,
 `sample_manifest.json`. JSON: samples the largest array (Azure `value`, Elastic `hits.hits`) and
 fixes `count`-style fields. Every format is streamed in two passes (count, then write the picks),
-JSON included. XLSX: same full/streamed split as above. Same Ctrl-C handling.
+JSON included. XLSX: same full/streamed split as above; the streamed path counts rows with
+`xlsx_count_rows` (regex scan of the sheet XML for rows with a non-empty `<v>`/`<t>`, ~100 MB/s,
+% progress) instead of a full read - openpyxl read-only took minutes on a 3 GB book and looked
+stuck. Same Ctrl-C handling.
 
 ## Known gaps / ideas (not done yet)
 - Anonymizer can't read `.gz` directly (sampler can).
